@@ -433,6 +433,18 @@ fn final_line(report: &RestoreReport, options: &RestoreOptions, out: &mut dyn Wr
                 ""
             }
         ),
+        (Outcome::NotVerified, sent) if report.writes_acked == 0 => format!(
+            "NO WRITE ACCEPTED by controller {number}: {sent} write(s) of {length} bytes at wire address 0x{:04X} sent, all answered with an error; {}",
+            options.address,
+            match (&report.readback, &report.before) {
+                (Some(back), Some(before)) if back == before =>
+                    "the block in the controller is unchanged (identical to the block read before the write)",
+                (Some(_), _) =>
+                    "the block in the controller DIFFERS from the block read before the write: act on it",
+                (None, _) =>
+                    "no read-back could be obtained after the writes: the block in the controller is unknown, act on it",
+            }
+        ),
         (Outcome::NotVerified, sent) => format!(
             "WRITTEN BUT NOT VERIFIED controller {number}: {sent} write(s) of {length} bytes at wire address 0x{:04X} sent, {} acknowledged, the read-back still differs: the controller may hold a wrong block, act on it",
             options.address, report.writes_acked

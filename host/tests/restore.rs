@@ -84,8 +84,13 @@ fn crc_arc(data: &[u8]) -> u16 {
 
 /// A good-looking read answer with a block that is not the one written.
 fn wrong_read_answer(block: &[u8]) -> Fault {
+    wrong_read_answer_at(block, 50)
+}
+
+/// Like `wrong_read_answer`, differing from `block` at exactly `offset`.
+fn wrong_read_answer_at(block: &[u8], offset: usize) -> Fault {
     let mut wrong = block.to_vec();
-    wrong[50] ^= 0x55;
+    wrong[offset] ^= 0x55;
     let [low, high] = crc_arc(&wrong).to_le_bytes();
     wrong.extend([low, high, 0x30]);
     Fault::Replace(wrong)
@@ -315,6 +320,90 @@ fn a_read_back_that_keeps_differing_ends_with_status_four_after_exactly_three_wr
         "{text}"
     );
     assert_eq!(*commands(&sent).last().unwrap(), 0x34);
+}
+
+fn a_single_byte_difference_in_the_read_back_at(offset: usize) {
+    let mut sim = controllers(4);
+    let block = block_of(&sim, 0);
+    let mut faults = Vec::new();
+    faults.extend(std::iter::repeat_n(Fault::Pass, 3));
+    for _ in 0..3 {
+        faults.extend(std::iter::repeat_n(Fault::Pass, 4));
+        faults.push(wrong_read_answer_at(&block, offset));
+    }
+    sim.faults(0, faults);
+
+    let (report, text, _, _) = session(sim, true, &restore_options(0, block.clone(), false));
+
+    assert_eq!(report.status(), 4, "{text}");
+    assert_eq!(report.outcome, Outcome::NotVerified);
+    assert_eq!((report.writes_sent, report.writes_acked), (3, 3));
+    assert_eq!(
+        report.readback.as_ref().unwrap()[offset],
+        block[offset] ^ 0x55
+    );
+    let range = format!("0x{offset:02X}-0x{offset:02X}: FILE");
+    assert!(text.contains(&range), "{range}\n{text}");
+    assert!(
+        text.contains("FINAL: WRITTEN BUT NOT VERIFIED controller 1"),
+        "{text}"
+    );
+}
+
+#[test]
+fn a_read_back_differing_only_at_the_first_offset_is_not_verified() {
+    a_single_byte_difference_in_the_read_back_at(0x00);
+}
+
+#[test]
+fn a_read_back_differing_only_in_the_second_half_is_not_verified() {
+    a_single_byte_difference_in_the_read_back_at(0x5C);
+}
+
+#[test]
+fn a_read_back_differing_only_at_the_last_offset_is_not_verified() {
+    a_single_byte_difference_in_the_read_back_at(BLOCK_LEN - 1);
+}
+
+/// Every write is answered with an error (the payload's acknowledgement), then the read-back
+/// taken after the loop is `last`.
+fn all_writes_refused(last: Fault) -> (RestoreReport, String) {
+    let mut sim = controllers(4);
+    let block = block_of(&sim, 0);
+    let mut faults = Vec::new();
+    faults.extend(std::iter::repeat_n(Fault::Pass, 3));
+    for _ in 0..3 {
+        faults.push(Fault::Pass);
+        faults.push(Fault::WrongAck(0xC2));
+        faults.push(Fault::Pass); // the program step still answers
+    }
+    faults.push(Fault::Pass);
+    faults.push(last);
+    sim.faults(0, faults);
+    let (report, text, _, _) = session(sim, true, &restore_options(0, block, false));
+    (report, text)
+}
+
+#[test]
+fn when_no_write_was_accepted_the_final_line_does_not_say_written_and_status_is_four() {
+    let (report, text) = all_writes_refused(Fault::Pass);
+    assert_eq!(report.status(), 4, "{text}");
+    assert_eq!(report.outcome, Outcome::NotVerified);
+    assert_eq!((report.writes_sent, report.writes_acked), (3, 0));
+    assert!(
+        text.contains("FINAL: NO WRITE ACCEPTED by controller 1: 3 write(s) of 184 bytes at wire address 0x7C00 sent, all answered with an error; the block in the controller is unchanged (identical to the block read before the write)"),
+        "{text}"
+    );
+    assert!(!text.contains("WRITTEN BUT"), "{text}");
+
+    let block = report.before.clone().unwrap();
+    let (report, text) = all_writes_refused(wrong_read_answer(&block));
+    assert_eq!(report.status(), 4, "{text}");
+    assert!(
+        text.contains("FINAL: NO WRITE ACCEPTED by controller 1: 3 write(s) of 184 bytes at wire address 0x7C00 sent, all answered with an error; the block in the controller DIFFERS from the block read before the write: act on it"),
+        "{text}"
+    );
+    assert!(!text.contains("WRITTEN BUT"), "{text}");
 }
 
 // ---------------------------------------------------------------- the other statuses
