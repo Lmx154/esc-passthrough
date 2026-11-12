@@ -1,6 +1,6 @@
 # esc-passthrough
 
-Sans-IO codecs for letting the AM32 configurator on a computer reach ESCs through a flight controller, `no_std`, no allocation. The crate holds the three wire formats the flight controller needs: the MSP v1 messages the configurator opens with, the "four-way interface" it speaks afterwards, and the byte sequences of the AM32 bootloader on the ESC's signal wire. Bytes in, typed values out, and back. On top of the bootloader codecs sits the one piece that does I/O without owning any: a small async client for the exchanges on one ESC's line (connect, read, write, erase, keep-alive, run), over a line trait the board implements. On the computer side there is the sans-IO host side: a recogniser for the one MSP request that opens the configurator's conversation (`MspTrigger`) and `HostSide`, which takes the configurator's bytes, answers the MSP requests that need no decision, hands out the four-way requests and builds their replies, without executing anything on an ESC. The crate owns no timer, keeps no session on the lines and names no transport, HAL or board. It has no dependencies; `defmt` 1.0 is optional. It is written for the MARV V2 flight controller but takes everything from the caller.
+Sans-IO codecs for letting the AM32 configurator on a computer reach ESCs through a flight controller, `no_std`, no allocation. The crate holds the three wire formats the flight controller needs: the MSP v1 messages the configurator opens with, the "four-way interface" it speaks afterwards, and the byte sequences of the AM32 bootloader on the ESC's signal wire. Bytes in, typed values out, and back. On top of the bootloader codecs sits the one piece that does I/O without owning any: a small async client for the exchanges on one ESC's line (connect, read, write, erase, keep-alive, run), over a line trait the board implements. On the computer side there is the sans-IO host side: a recogniser for the one MSP request that opens the configurator's conversation (`MspTrigger`) and `HostSide`, which takes the configurator's bytes, answers the MSP requests that need no decision, hands out the four-way requests and builds their replies, without executing anything on an ESC. Finally the session (`session::Passthrough`) joins the two: it reads the configurator's bytes from any `embedded_io_async` stream, executes each four-way request on the lines the firmware lends it, and writes the replies back. The crate owns no timer (the caller's `embedded_hal_async::delay::DelayNs` is the only clock), owns no stream and no line, and names no transport, HAL or board. Its dependencies are `embedded-io-async` 0.7 and `embedded-hal-async` 1.0 (with the `embedded-io` and `embedded-hal` they re-export traits from); `defmt` 1.0 is optional. It is written for the MARV V2 flight controller but takes everything from the caller.
 
 Status: version 0.1.0, `publish = false`, and the API may still change. It has been tested on a host only. **Nothing has run against a real ESC or against the real configurator**: every byte sequence was written from the configurator's source, the AM32 bootloader's source and ArduPilot's behaviour, and the golden vectors were worked out by hand from them (no captured traffic exists).
 
@@ -167,13 +167,165 @@ host.exited();
 assert_eq!(host.mode(), Mode::Msp);
 ```
 
+Session: the configurator's requests arrive on a byte stream and are executed on the lines. Everything here is a fake, as in the examples above: a line that answers the init, a stream that holds the whole conversation, a delay that does not wait (it pends once, so a read that has data wins the race against the idle timer) and a lender that hands the line over once. A board provides the real ones. The firmware has already read the trigger request out of the stream and hands it to `run` as `preload`.
+
+```rust
+use core::convert::Infallible;
+use core::future::{poll_fn, Future};
+use core::pin::pin;
+use core::task::{Context, Poll, Waker};
+use embedded_hal_async::delay::DelayNs;
+use embedded_io_async::{ErrorType, Read, Write};
+use esc_passthrough::line::EscLines;
+use esc_passthrough::msp::BatteryState;
+use esc_passthrough::session::{Exit, Lender, Passthrough, SessionConfig};
+
+struct FakeLine {
+    to_read: &'static [u8],
+    breaks: u32,
+}
+
+impl EscLines for FakeLine {
+    type Error = Infallible;
+    fn select(&mut self, _line: u8) -> Result<(), Infallible> {
+        Ok(())
+    }
+    async fn write(&mut self, _bytes: &[u8]) -> Result<(), Infallible> {
+        Ok(())
+    }
+    async fn read(&mut self, buf: &mut [u8], timeout_us: u32) -> Result<usize, Infallible> {
+        let n = if timeout_us == 0 { 0 } else { buf.len().min(self.to_read.len()) };
+        buf[..n].copy_from_slice(&self.to_read[..n]);
+        self.to_read = &self.to_read[n..];
+        Ok(n)
+    }
+    fn set_break(&mut self, on: bool) -> Result<(), Infallible> {
+        self.breaks += u32::from(on);
+        Ok(())
+    }
+}
+
+struct FakeStream {
+    input: &'static [u8],
+    output: Vec<u8>,
+}
+
+impl ErrorType for FakeStream {
+    type Error = Infallible;
+}
+
+impl Read for FakeStream {
+    async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Infallible> {
+        let n = buf.len().min(self.input.len());
+        buf[..n].copy_from_slice(&self.input[..n]);
+        self.input = &self.input[n..];
+        Ok(n)
+    }
+}
+
+impl Write for FakeStream {
+    async fn write(&mut self, buf: &[u8]) -> Result<usize, Infallible> {
+        self.output.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    async fn flush(&mut self) -> Result<(), Infallible> {
+        Ok(())
+    }
+}
+
+struct FakeDelay;
+
+impl DelayNs for FakeDelay {
+    async fn delay_ns(&mut self, _ns: u32) {
+        let mut pended = false;
+        poll_fn(|_| {
+            if pended { Poll::Ready(()) } else { pended = true; Poll::Pending }
+        })
+        .await;
+    }
+}
+
+struct FakeLender(Option<FakeLine>);
+
+impl Lender for FakeLender {
+    type Lines = FakeLine;
+    async fn lend(&mut self) -> Option<FakeLine> {
+        self.0.take()
+    }
+}
+
+fn block_on<F: Future>(future: F) -> F::Output {
+    let mut future = pin!(future);
+    let mut cx = Context::from_waker(Waker::noop());
+    loop {
+        if let Poll::Ready(value) = future.as_mut().poll(&mut cx) {
+            return value;
+        }
+    }
+}
+
+// What the configurator sends after the trigger: MSP_SET_PASSTHROUGH, InitFlash for ESC 0,
+// InterfaceExit.
+let input: &[u8] = &[
+    0x24, 0x4D, 0x3C, 0x00, 0xF5, 0xF5,
+    0x2F, 0x37, 0x00, 0x00, 0x01, 0x00, 0xA8, 0x00,
+    0x2F, 0x34, 0x00, 0x00, 0x01, 0x00, 0x46, 0xD2,
+];
+let trigger = [0x24, 0x4D, 0x3C, 0x00, 0x01, 0x01];
+// The ESC's answer to the init: "471", pin code 0x14, 0x1F, 6, 6, version 3, 0x30.
+let esc = FakeLine { to_read: &[0x34, 0x37, 0x31, 0x14, 0x1F, 0x06, 0x06, 0x03, 0x30], breaks: 0 };
+
+let mut rx = FakeStream { input, output: Vec::new() };
+let mut tx = FakeStream { input: &[], output: Vec::new() };
+let mut lender = FakeLender(Some(esc));
+let mut session = Passthrough::new(SessionConfig::new());
+let exit = block_on(session.run(&trigger, &mut rx, &mut tx, &mut lender, &mut FakeDelay, || BatteryState::new(0)));
+assert_eq!(exit, Exit::Exited);
+
+// MSP_API_VERSION, the grant (4 ESCs), the init reply (signature 0x1F06, pin code 0x14, mode 4),
+// and the exit reply.
+assert_eq!(
+    tx.output,
+    [
+        &[0x24, 0x4D, 0x3E, 0x03, 0x01, 0x00, 0x01, 0x2A, 0x29][..],
+        &[0x24, 0x4D, 0x3E, 0x01, 0xF5, 0x04, 0xF0],
+        &[0x2E, 0x37, 0, 0, 4, 0x06, 0x1F, 0x14, 0x04, 0x00, 0x12, 0x5A],
+        &[0x2E, 0x34, 0, 0, 1, 0x00, 0x00, 0x42, 0x63],
+    ]
+    .concat()
+);
+// The lines exit is done, so the lines can be given back to the firmware.
+assert!(session.holds_lines());
+let line = session.release().unwrap();
+assert_eq!(line.breaks, 1);
+```
+
 ## What the application provides
 
 - The bytes: the host side's serial stream goes into the two request parsers; the ESC's bytes go into the reply parsers, already read from the wire. The crate reads and writes nothing itself.
 - The values for the MSP replies: API version triple, the four ASCII bytes of the flight controller variant (the configurator knows `BTFL`, `KISS`, `INAV`, `ARDU` and `EMUF`), battery voltage in millivolts with optional current and charge, the number of motors, the number of ESCs.
 - Output buffers. Every encoder takes `&mut [u8]`, returns the length written, and returns `EncodeError::BufferTooSmall { needed }` without writing if it does not fit. `msp::MAX_FRAME_LEN`, `fourway::MAX_REPLY_LEN` and `bootloader::MAX_DATA + 2` are the largest sizes.
 - For the client: an `EscLines` implementation (select a line, send bytes back to back, read with a timeout that the implementer measures, pull all lines low) and, if the defaults do not suit, `client::Timeouts`.
-- Ordering and sessions: which four-way command becomes which bootloader sequence, when to retry, when to hold the line, what to do after an error (see the rules below).
+- For the session: the host byte stream as `embedded_io_async::Read` and `Write` (the read must be cancel-safe: a read future that is dropped has taken no byte), a `DelayNs` (the only clock the session has), a `session::Lender` that hands the lines over when the configurator asks and returns `None` to refuse, and a closure that returns the battery figure when the configurator asks for it.
+
+## What the firmware must do
+
+The session takes the motor controllers' lines, so two duties belong to the firmware, not to the crate:
+
+1. **Lend the lines only while the vehicle is disarmed.** `Lender::lend` is called at `MSP_SET_PASSTHROUGH` and nowhere else (never while the session already holds lines); return `None` to refuse and the configurator gets the MSP error reply and may ask again. The crate has no notion of armed.
+2. **After cancelling `Passthrough::run` (dropping its future, at any await), call `finish()`.** Until `finish` has run the exit, the controllers stay inert in their bootloaders until they are power-cycled. `release()` refuses (`ReleaseError::ExitOwed`) while lines are held and the exit break is not done, and gives the lines back after. `run` calls `finish` itself when it returns, whatever the `Exit`.
+
+Also: stop whatever else drives the lines before lending them, and take them back (`release()`) before driving them again. The firmware's own tap that decides when to start a session at all (it recognises the trigger with `MspTrigger` and hands the bytes it has read to `run` as `preload`) is the firmware's.
+
+## The session
+
+`Passthrough::run(preload, rx, tx, lender, delay, battery)` serves one configurator until it leaves and returns why: `Exit::Idle` (`idle_ms`, default 5 s, without a complete valid MSP request while no lines are held; bytes that are no request do not restart the time), `Exit::Exited` (`InterfaceExit`), `Exit::Closed` (the stream ended) or `Exit::Host(e)` (a read, write or flush failed). Whenever lines were held, the lines exit is done before `run` returns: all lines low together for `break_ms` (default 25, the bootloader jumps after 20 ms), then released.
+
+- The lines are taken at `MSP_SET_PASSTHROUGH` only, through the lender. After the reply the session waits `park_ms` (default 3000) with the caller's delay, with the lines held high and silent, before any line operation; the host stream is not read meanwhile. After that one line is active at a time, the one of the controller the request names (`line_map` maps the index to the line number).
+- Each four-way request is answered exactly once, echoing its command and address; nothing is written to the host except in reply to a complete request. The line operation of each command, the reply and the acknowledge are in the table of the `session` module documentation (init-flash is one connect, no retry; read, write 2 to 256 bytes, page erase at `page << 10` and device reset map to the client's operations; every other command gets what ArduPilot answers for an ARM bootloader, or the invalid-command acknowledge). Any client error becomes the general-error acknowledge and the session goes on; nothing is retried. The session never looks inside a payload and holds no settings layout.
+- A configurator that starts over without exiting (a valid MSP request in four-way mode): the lines exit is done, the lines are kept, the request is answered in the MSP phase, and the next grant waits `park_ms` again. While lines are held, silence ends nothing.
+- State lives in the `Passthrough`, not in the future of `run`, so a dropped `run` leaves `finish` and `release` everything they need. A drop during the exit break leaves the lines low; `finish` then waits the whole `break_ms` again before releasing them.
+- `SessionConfig` (`#[non_exhaustive]`, `new()` and `with_` setters): `esc_count` (1 to 8, default 4), `line_map`, `park_ms`, `break_ms`, `idle_ms`, the client's `Timeouts`, and the `HostInfo` values of the MSP and housekeeping replies.
 
 ## Rules for correct use
 
@@ -198,17 +350,18 @@ assert_eq!(host.mode(), Mode::Msp);
 - `client`: `Client<L: EscLines>` with `connect` (init, 9-byte reply into `DeviceInfo`), `read(address, buf)` and `write(address, data)` (2 to 256 bytes; write is set address, set buffer, wait for the answer that does not come, payload, program), `erase(address)`, `keep_alive` (the `C1` is success), `run_application`. Each is one exchange or a fixed sequence and returns `Error<E>`, which says the `Step` and which of: line error, nothing in time, short answer, bad CRC from the ESC, refused (`C1`, `C2`), unexpected byte; plus `InvalidLength` for a read outside 1 to 256 or a write outside 2 to 256 bytes (nothing is sent) and `InvalidLine` for a line above 31. `select(line)` forwards to the line and remembers it; `resync()` and `needs_resync()` belong to rule 7. `Timeouts` (`#[non_exhaustive]`, `new()` and `with_` setters) holds the waits; the defaults are ArduPilot's: 2 ms for the acknowledge of set address and keep-alive, 5 ms after set buffer, 40 ms for the payload, 500 ms for program, 3 s for erase, and for a multi-byte reply (init, read) the first byte may take 1 ms times the length of the reply and each next byte 1 ms. The client never looks inside data or buffers and has no notion of what an address means; `read` writes the caller's buffer only when the whole reply is good.
 - `trigger`: `MspTrigger::feed(&[u8]) -> Option<usize>` recognises exactly `24 4D 3C 00 01 01` (MSP v1 `MSP_API_VERSION`, no payload) in a byte stream, at any split. `Some(n)` says the request completed with the `n`th byte of the slice (the rest is not looked at); a partial match is kept for the next call. It fires once per occurrence and never on a request with one byte changed, another length or another command; it knows nothing else about MSP.
 - `host`: `HostSide` owns one MSP and one four-way request parser and the mode. `feed(bytes, &HostInfo, out) -> (used, Option<Event>)` stops at the first event and writes at most one reply, only after the last byte of a complete request. In MSP mode it answers commands 1, 2, 130 and 131 from `HostInfo` (`Event::Reply`; defaults are ArduPilot's), answers any other command and a `MSP_SET_PASSTHROUGH` with a payload with the MSP error reply, ignores malformed frames, and reports a plain `MSP_SET_PASSTHROUGH` as `Event::PassthroughRequested`: the application calls `grant(esc_count, out)` (four-way mode) or `refuse(out)` (error reply, stays MSP); until it does, `feed` consumes nothing and reports the request again. In four-way mode each CRC-valid request is handed out as `Event::FourWay` (command, address, parameters, all opaque) and answered by the application with `encode_success` or `encode_failure` (command and address echoed, as `four_way.ts:400-402` requires), or for protocol version, interface name and interface version by `answer_housekeeping`; a request with a bad CRC is answered by the crate (ACK `03`, the received command and address and first parameter, ArduPilot's failure-reply shape) and not handed out. The application calls `exited()` when `InterfaceExit` is dealt with and the mode is MSP again. A configurator that restarts without exiting: bytes go to the four-way parser first, and only bytes that arrive between four-way frames and are not `0x2F` go to the MSP parser; a complete valid MSP request found that way is `Event::Restarted` (the mode stays four-way until the application calls `exited()`), MSP errors there are ignored, and a `$` inside a four-way frame never reaches the MSP parser. No ESC index check, no line, no timing.
+- `session`: `Passthrough<L: EscLines>` (`run`, `finish`, `release`, `holds_lines`), `SessionConfig`, the `Lender` trait, `Exit<E>` (`Idle`, `Exited`, `Closed`, `Host(E)`) and `ReleaseError` (`NotHeld`, `ExitOwed`). See "The session" and "What the firmware must do" above.
 - Addresses and payloads are opaque. The crate has no settings layout, no setting names and no magic address list.
 - No panic for any input and no allocation. Enums that copy a complete protocol table (`fourway::Command`, `fourway::Ack`, `bootloader::Ack`) are exhaustive; error enums and the structs that hold reply values are `#[non_exhaustive]` (build the structs with `new` and the `with_` setters).
 
 ## Not covered
 
-- The session that executes requests on the lines: turning the four-way requests `HostSide` hands out into bootloader traffic with its retries and waits (InitFlash trying the bootloader up to three times, DeviceWrite as the client's `write`, and so on), checking ESC indexes, lending the lines to it, and the 5 s limit before the grant. `HostSide` checks nothing about an ESC; the client only resyncs a line after a failed payload. Nothing here reads a host serial port or runs an async loop over one.
-- Entering and leaving the bootloader: holding the line high, the 2 s wait for the ESC to reset, the 20 ms break that sends it back to its application. `set_break` is on the trait; nothing calls it.
-- Anything on a board: pins, PIO, the USB serial port, stopping the motor signal, the permission to take the lines.
-- A timer: the client passes timeouts to the line and measures nothing. The bootloader's own limits (5 bit times between the bytes of a command, 250 us for a command without payload, 20 ms of line low) are the line implementation's business; neither the client nor the test simulator checks them.
-- The bootloader's page erase: the `02 01` command only checks the address, and the client's `erase` does nothing more. The four-way commands for devices other than the AM32 bootloader: the codes parse and encode, nothing answers them.
-- The opposite directions, for a computer-side tool: encoders for MSP and four-way requests, parsers for MSP and four-way replies, an encoder for the ESC's bootloader replies. Also MSP v2, MSP messages other than the five, and the configurator's "direct" route (one ESC, 19200 baud, its own bytes echoed).
+- Anything on a board. The crate has no pins, PIO, USB serial port, motor-signal driver or permission logic: the `EscLines` implementation, the host byte stream, the `Lender` (and so the check that the vehicle is disarmed) and the clock are the firmware's. Nothing here has run on a board.
+- Any real motor controller or the real configurator: the session is tested against the simulated bootloader and a scripted stream whose bytes were laid out from the configurator's source (`four_way.ts`, `SerialDevice.vue`) and ArduPilot's behaviour. No captured traffic exists.
+- The firmware's own tap that decides when to start a session: recognising the trigger (`MspTrigger` is here), checking the vehicle is disarmed, handing the bytes read so far to `run` as `preload`, and ending the session when a ground station appears (by dropping `run` and calling `finish`).
+- The bootloader's limits (5 bit times between the bytes of a command, 250 us for a command without payload, 20 ms of line low) are the line implementation's business; neither the client nor the test simulator checks them, and the simulator does not model the jump the exit break causes.
+- Retries: the configurator retries (init-flash is one connect, not ArduPilot's three); the session retries nothing.
+- ArduPilot's `cmd_DeviceVerify`, which the client has no operation for, answers the invalid-command acknowledge; the interface mode requested by `cmd_InterfaceSetMode` is acknowledged and not kept; init-flash always reports interface mode 4 (ArduPilot answers the general error for a part it does not recognise).
 - Reading the settings block, the file name or the device-info block that the bootloader serves at its magic addresses: `read` reads any address, it does not interpret what comes back.
 
 ## Tests
@@ -218,6 +371,8 @@ Host: `cargo test` (integration tests, proptests and the examples in this file, 
 The client is tested against a simulated bootloader in `tests/common/sim.rs` (up to four ESCs, each with a flash image), written from the bootloader's `main.c` and not from this crate's encoders, and checked on its own in `tests/simulator.rs` with hand-worked byte sequences. It models the init match, the device-info reply, set address with the magic addresses, set buffer without answer, the payload with its CRC check (and the wait for another payload after a bad one, which the client's resync answers), program (refused below the application and for a misaligned write on parts that demand it; a plain overwrite, with no page erase), erase, read (the address is forgotten), keep-alive, run (with the jump checks), the three acknowledges, the count of bad commands and the jump after 100. Its fault switches: no answer, a late answer, a truncated answer, a corrupted CRC, a wrong acknowledge, any replacement bytes, answers split into single bytes, a damaged request, an injected line error. Time in it is virtual. The client tests also check the exact bytes and the order and timeouts of the line calls, that they do not depend on the data, that every error variant is produced and the next operation then works, and with proptests that arbitrary bytes from the line never panic or pass for other data. The simulator and the `block_on` that drives the futures are test code only.
 
 The host side is tested in `tests/trigger.rs` and `tests/host.rs`. The trigger: the 6 bytes inserted at random positions into random bytes and into random well-formed frames of another format give exactly one firing per insertion at every split (checked against a naive search), a stream with no insertion fires only where a naive search finds the sequence, every single-byte corruption and every other length or command give none. `HostSide`: the configurator's connect conversation (four MSP requests, passthrough with grant, InitFlash, DeviceRead, InterfaceExit, MSP again) with the replies compared byte for byte against vectors laid out by hand and a separate CRC script, at every split into two and three parts and byte by byte (each event, and so each reply, comes at the last byte of its request); refusal and a second attempt; unknown command; bad four-way CRC answered and not handed out; the restart rule (a valid MSP request between frames is `Restarted`, the same six bytes inside a frame's parameters are not); mode after `exited()`; oracle proptests for both modes at random splits; arbitrary bytes never panic.
+
+The session is tested in `tests/session.rs`, `tests/session_cancel.rs` and `tests/session_props.rs`, with doubles in `tests/common/session_support.rs` (a virtual clock with its own executor, a scripted host stream, a delay on that clock, a lender, the simulator behind a recorder) and the conversation's vectors in `tests/common/session_talk.rs`. The configurator's conversation (the MSP requests, the passthrough request, its 2 s wait, init-flash and the three reads of `getInfo` for each of four controllers, `InterfaceExit`) is replayed with every reply byte compared against literal vectors (checksums computed with a separate script) or frames built from the layouts with the bit-serial CRC; the line log shows nothing on any line before `park_ms` after the grant, traffic only on the selected line (each simulated bootloader receives exactly its own bytes), and one exit break of at least `break_ms` on all lines after the exit reply; `release()` is refused while the exit is owed. Also: a settings-style write of 184 bytes and its read-back; each `Exit` (idle, with the idle time not restarted by noise; interface-exit; read, write and flush errors with and without lines held; end of stream; refusal then a second grant; a restart); each error path (index out of range with no line traffic, a request before any init-flash, a client timeout mid-read, the stuck payload recovered); every command of the table; the counts of invariant 5.2 (no write before a complete request, one reply per request) in every conversation. A cancellation sweep drops `run` at every await of the whole conversation (1322 of them), then `finish()` and `release()` must succeed, the log must show exactly one exit break after the last line traffic, and a fresh session on the returned lines must work. A proptest checks that for random payloads, addresses, counts and flash contents the line operations are the same and the bytes the host receives are exactly the simulator's. The tests were checked against four deliberate faults in the session (no park, no break wait, a second break on resume, a write length that depends on the first payload byte), each of which makes a test fail.
 
 The simulator and every timing here follow the AM32 bootloader source from v12 on. Older bootloaders exist in the field (the lead's bench controllers report bootloader version 1, whose source is not available), and nothing in this crate has been run against any real bootloader.
 
@@ -231,8 +386,8 @@ Feature `defmt` (off by default): `defmt::Format` for the public types.
 
 ```text
 Cargo.toml   the crate
-src/         msp.rs, fourway.rs, bootloader.rs, line.rs, client.rs, trigger.rs, host.rs, error.rs (EncodeError and the output writer)
-tests/       one file per module (client.rs for line and client, trigger.rs, host.rs), simulator.rs, and common/ with the bit-serial reference CRCs, the simulated bootloader (sim.rs) and block_on.rs
+src/         msp.rs, fourway.rs, bootloader.rs, line.rs, client.rs, trigger.rs, host.rs, session.rs, error.rs (EncodeError and the output writer)
+tests/       one file per module (client.rs for line and client, trigger.rs, host.rs), simulator.rs, session.rs, session_cancel.rs, session_props.rs, and common/ with the bit-serial reference CRCs, the simulated bootloader (sim.rs), block_on.rs and the session doubles
 ```
 
 MIT, see `LICENSE`.

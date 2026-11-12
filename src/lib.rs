@@ -3,7 +3,7 @@
 //! The configurator on a computer speaks two protocols to a flight controller: MSP v1 first, and
 //! after `MSP_SET_PASSTHROUGH` the "four-way interface". The flight controller turns four-way
 //! commands into the AM32 bootloader's one-wire byte sequences. This crate holds the three wire
-//! formats as pure functions on bytes; it does no I/O, owns no timer and keeps no session:
+//! formats as pure functions on bytes; it does no I/O of its own and owns no timer:
 //!
 //! - [`msp`]: an incremental MSP v1 request parser and the five replies the configurator needs
 //!   (plus the error reply).
@@ -27,6 +27,13 @@
 //! - [`host`]: [`HostSide`](host::HostSide), which takes the bytes arriving from the configurator
 //!   and says what they ask for, answers the MSP requests that need no decision and builds the
 //!   four-way replies. It executes nothing on an ESC.
+//!
+//! And the one piece that joins them:
+//!
+//! - [`session`]: [`Passthrough`](session::Passthrough), which reads the configurator's bytes from an
+//!   `embedded_io_async` stream, executes each four-way request on the lines the firmware lends it
+//!   and writes the replies back. It owns no stream, line or timer: the caller's `DelayNs` is the
+//!   only clock.
 //!
 //! Payloads and addresses are opaque byte slices and `u16`s. Nothing here knows what any byte of
 //! an ESC's settings means.
@@ -60,6 +67,7 @@ pub mod fourway;
 pub mod host;
 pub mod line;
 pub mod msp;
+pub mod session;
 pub mod trigger;
 
 pub use error::EncodeError;
