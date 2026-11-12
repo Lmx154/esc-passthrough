@@ -1,6 +1,6 @@
 # esc-passthrough
 
-Sans-IO codecs for letting the AM32 configurator on a computer reach ESCs through a flight controller, `no_std`, no allocation. The crate holds the three wire formats the flight controller needs: the MSP v1 messages the configurator opens with, the "four-way interface" it speaks afterwards, and the byte sequences of the AM32 bootloader on the ESC's signal wire. Bytes in, typed values out, and back. It does no I/O, owns no timer, keeps no session and names no transport, HAL or board. It has no dependencies; `defmt` 1.0 is optional. It is written for the MARV V2 flight controller but takes everything from the caller.
+Sans-IO codecs for letting the AM32 configurator on a computer reach ESCs through a flight controller, `no_std`, no allocation. The crate holds the three wire formats the flight controller needs: the MSP v1 messages the configurator opens with, the "four-way interface" it speaks afterwards, and the byte sequences of the AM32 bootloader on the ESC's signal wire. Bytes in, typed values out, and back. On top of the bootloader codecs sits the one piece that does I/O without owning any: a small async client for the exchanges on one ESC's line (connect, read, write, erase, keep-alive, run), over a line trait the board implements. The crate owns no timer, keeps no session and names no transport, HAL or board. It has no dependencies; `defmt` 1.0 is optional. It is written for the MARV V2 flight controller but takes everything from the caller.
 
 Status: version 0.1.0, `publish = false`, and the API may still change. It has been tested on a host only. **Nothing has run against a real ESC or against the real configurator**: every byte sequence was written from the configurator's source, the AM32 bootloader's source and ArduPilot's behaviour, and the golden vectors were worked out by hand from them (no captured traffic exists).
 
@@ -65,12 +65,73 @@ let answer = [0x01, 0x02, 0x03, 0x04, 0xA1, 0x0F, 0x30];
 assert_eq!(parse_read_reply(&answer, 4), Ok(&answer[..4]));
 ```
 
+Bootloader client: connect to an ESC over a line. The line here is a fake that answers the init and nothing else; a board implements `EscLines` for its pins and its clock.
+
+```rust
+use core::convert::Infallible;
+use core::future::Future;
+use core::pin::pin;
+use core::task::{Context, Poll, Waker};
+use esc_passthrough::client::{Client, Error, Step};
+use esc_passthrough::line::EscLines;
+
+struct FakeLine {
+    to_read: &'static [u8],
+    sent: usize,
+}
+
+impl EscLines for FakeLine {
+    type Error = Infallible;
+    fn select(&mut self, _line: u8) -> Result<(), Infallible> {
+        Ok(())
+    }
+    async fn write(&mut self, bytes: &[u8]) -> Result<(), Infallible> {
+        self.sent += bytes.len();
+        Ok(())
+    }
+    async fn read(&mut self, buf: &mut [u8], timeout_us: u32) -> Result<usize, Infallible> {
+        // A real line waits up to `timeout_us` for a byte; this one has what is left or nothing.
+        let n = if timeout_us == 0 { 0 } else { buf.len().min(self.to_read.len()) };
+        buf[..n].copy_from_slice(&self.to_read[..n]);
+        self.to_read = &self.to_read[n..];
+        Ok(n)
+    }
+    fn set_break(&mut self, _on: bool) -> Result<(), Infallible> {
+        Ok(())
+    }
+}
+
+fn block_on<F: Future>(future: F) -> F::Output {
+    let mut future = pin!(future);
+    let mut cx = Context::from_waker(Waker::noop());
+    loop {
+        if let Poll::Ready(value) = future.as_mut().poll(&mut cx) {
+            return value;
+        }
+    }
+}
+
+// What an ESC answers to the init: "471", pin code, flash size code, 6, 6, version 3, 0x30.
+let reply = &[0x34, 0x37, 0x31, 0x14, 0x1F, 0x06, 0x06, 0x03, 0x30];
+let mut client = Client::new(FakeLine { to_read: reply, sent: 0 });
+client.select(0).unwrap();
+let info = block_on(client.connect()).unwrap();
+assert_eq!((info.pin_code, info.signature()), (0x14, 0x1F06));
+assert_eq!(client.line().sent, 21);
+// The fake has nothing more to say, so a keep-alive gets no answer in time.
+assert_eq!(
+    block_on(client.keep_alive()),
+    Err(Error::Timeout { step: Step::KeepAlive })
+);
+```
+
 ## What the application provides
 
 - The bytes: the host side's serial stream goes into the two request parsers; the ESC's bytes go into the reply parsers, already read from the wire. The crate reads and writes nothing itself.
 - The values for the MSP replies: API version triple, the four ASCII bytes of the flight controller variant (the configurator knows `BTFL`, `KISS`, `INAV`, `ARDU` and `EMUF`), battery voltage in millivolts with optional current and charge, the number of motors, the number of ESCs.
 - Output buffers. Every encoder takes `&mut [u8]`, returns the length written, and returns `EncodeError::BufferTooSmall { needed }` without writing if it does not fit. `msp::MAX_FRAME_LEN`, `fourway::MAX_REPLY_LEN` and `bootloader::MAX_DATA + 2` are the largest sizes.
-- Timing, ordering and sessions: which four-way command becomes which bootloader sequence, how long to wait for each reply, when to retry, when to hold the line.
+- For the client: an `EscLines` implementation (select a line, send bytes back to back, read with a timeout that the implementer measures, pull all lines low) and, if the defaults do not suit, `client::Timeouts`.
+- Ordering and sessions: which four-way command becomes which bootloader sequence, when to retry, when to hold the line, what to do after an error (see the rules below).
 
 ## Rules for correct use
 
@@ -81,28 +142,39 @@ assert_eq!(parse_read_reply(&answer, 4), Ok(&answer[..4]));
 5. `bootloader::parse_read_reply` wants exactly `n + 3` bytes. A refused read is answered with one byte; shorter input is `Truncated` and the caller decides, with its timeout, whether to read that byte with `parse_ack`.
 6. A bootloader acknowledge of `C1` or `C2` is a value (`Ack`), not an error, for `parse_ack`; the keep-alive expects `C1`. In replies that should be good (`parse_init_reply`, `parse_read_reply`) any other acknowledge is `ParseError::Rejected`.
 
+7. The bootloader keeps state, and the client closes the hazard it makes. After set buffer the ESC takes the next frame it receives as the payload, until a payload with a good CRC has arrived; if a payload is refused (`C2`) or lost it keeps waiting, and it passes the next valid command as a payload, answers `30` and does not run it, so the following write's set address would be acknowledged and ignored and that write would land at the old address. Therefore `Client` tracks the line (choose it with `Client::select`, not with `line_mut().select()`; lines 0 to 31) and marks it when a `write` fails after set buffer went out and before the payload's `30` came. The next operation on a marked line, or `Client::resync()`, first sends one keep-alive and accepts `30` (the ESC was waiting and took it) or `C1` (it was not); anything else is an error, the mark stays and the operation does not start. `needs_resync()` tells. One limit: an ESC waiting for a payload of one byte answers the keep-alive `C2`, and the mark then stays (`resync` returns `Refused` at `Step::Resync`); the client has no safe way to clear that.
+8. The bootloader source from v12 on answers the run command with `C1` before it jumps, and other bootloaders may send nothing; `run_application` reads and drops a `C1` and accepts silence. `Ok` does not say that the ESC left the bootloader; as the bootloader does, it may refuse to jump (the simulator models its checks: the first byte at the settings address must be 1, and the application's first two words must be in range).
+9. A write the ESC refuses comes back as `Error::Refused` and is not retried or reshaped: the client passes through what it is given. In the bootloader sources a program is refused (`C1`) below the application, and on every part also for an address or length that is not a multiple of the part's flash word (2 bytes on the F051, 4 on the F421, 8 on the G071, G431 and L431), so a write of 1, 2 or 255 bytes is refused on most parts. What the bootloader does on a write at the settings address longer than 2 bytes: it replaces byte 2 with its own version, so the read-back differs.
+10. Every client operation first reads the line with a timeout of 0 until nothing comes, to drop bytes an earlier failed exchange left behind. A late answer that arrives after that is not caught; the session decides how long to let the line settle after a timeout.
+
 ## What the crate does
 
 - `msp`: `RequestParser` for MSP v1 requests (`$M<`, length, command, payload, XOR checksum) yields `Request { command, payload }` or `ParseError::{BadHeader, BadChecksum}`. Storage: 255 payload bytes inside the struct. `Request::kind()` sorts the command into the five the configurator needs (1, 2, 130, 131, 245) or `Command::Unsupported(n)`; the crate does not answer an unsupported command. Replies: `encode_api_version`, `encode_fc_variant`, `encode_battery_state` (the 11-byte ArduPilot layout; the voltage in 0.1 V at byte 3 is the one the configurator reads, rounded and saturating at 25.5 V; cell count, capacity and state are 0; current in 0.01 A, charge in mAh, voltage in 0.01 V, all rounded and saturating), `encode_motor_config` (the motor count at byte 6, the other nine bytes 0), `encode_set_passthrough` (the ESC count), `encode_error` (`$M!`, length 0, the command, checksum) and the general `encode_reply`.
 - `fourway`: `RequestParser` for `0x2F`, command, address (high first), count (0 is 256), parameters, CRC16-XMODEM (high first); storage: 256 parameter bytes inside the struct. `Command` has every code of ArduPilot's protocol header (0x30 to 0x3F except 0x36, and 0x40) and `Unknown(code)`; `Ack` has the eleven codes of the configurator's table and `Unknown(code)`. `encode_reply` writes `0x2E`, command, address, count, parameters, acknowledge, CRC. `crc16_xmodem` and `crc16_xmodem_update` are public.
-- `bootloader`: `INIT` and `encode_init` (21 bytes, no CRC), `encode_set_address`, `encode_set_buffer` (1 to 256, with the high byte 1 for 256), `encode_payload` (data and its CRC, 1 to 256 bytes), `encode_program`, `encode_read` (1 to 256, sent as `n`, 256 as 0), `encode_keep_alive`, `encode_run` (`00 00 00 00`), `crc16` (0xA001 reflected, start 0, low byte first). Reply parsers: `parse_ack`, `parse_init_reply` (`DeviceInfo`: pin code, flash size code, two bytes of 0x06, protocol version; `signature()` is the 16-bit value the configurator uses to name the MCU), `parse_read_reply` (data, CRC, acknowledge; the data is returned as a borrowed slice).
+- `bootloader`: `INIT` and `encode_init` (21 bytes, no CRC), `encode_set_address`, `encode_set_buffer` (1 to 256, with the high byte 1 for 256), `encode_payload` (data and its CRC, 1 to 256 bytes), `encode_program`, `encode_erase` (`02 01`), `encode_read` (1 to 256, sent as `n`, 256 as 0), `encode_keep_alive`, `encode_run` (`00 00 00 00`), `crc16` (0xA001 reflected, start 0, low byte first). Reply parsers: `parse_ack`, `parse_init_reply` (`DeviceInfo`: pin code, flash size code, two bytes of 0x06, protocol version; `signature()` is the 16-bit value the configurator uses to name the MCU), `parse_read_reply` (data, CRC, acknowledge; the data is returned as a borrowed slice).
+- `line`: the trait `EscLines`: `select(line)`, `async write(bytes)` (back to back, returns after the last stop bit), `async read(buf, timeout_us)` (returns at once with at least one byte, or `Ok(0)` after the timeout; the implementer owns the clock), `set_break(on)`. The line does not echo what is written. The trait uses `async fn` in a public trait (the `async_fn_in_trait` lint is allowed in that module, as in the other drivers), which needs no dependency and no executor in this crate.
+- `client`: `Client<L: EscLines>` with `connect` (init, 9-byte reply into `DeviceInfo`), `read(address, buf)` and `write(address, data)` (1 to 256 bytes; write is set address, set buffer, wait for the answer that does not come, payload, program), `erase(address)`, `keep_alive` (the `C1` is success), `run_application`. Each is one exchange or a fixed sequence and returns `Error<E>`, which says the `Step` and which of: line error, nothing in time, short answer, bad CRC from the ESC, refused (`C1`, `C2`), unexpected byte; plus `InvalidLength` for an argument outside 1 to 256 (nothing is sent) and `InvalidLine` for a line above 31. `select(line)` forwards to the line and remembers it; `resync()` and `needs_resync()` belong to rule 7. `Timeouts` (`#[non_exhaustive]`, `new()` and `with_` setters) holds the waits; the defaults are ArduPilot's: 2 ms for the acknowledge of set address and keep-alive, 5 ms after set buffer, 40 ms for the payload, 500 ms for program, 3 s for erase, and for a multi-byte reply (init, read) the first byte may take 1 ms times the length of the reply and each next byte 1 ms. The client never looks inside data or buffers and has no notion of what an address means; `read` writes the caller's buffer only when the whole reply is good.
 - Addresses and payloads are opaque. The crate has no settings layout, no setting names and no magic address list.
 - No panic for any input and no allocation. Enums that copy a complete protocol table (`fourway::Command`, `fourway::Ack`, `bootloader::Ack`) are exhaustive; error enums and the structs that hold reply values are `#[non_exhaustive]` (build the structs with `new` and the `with_` setters).
 
 ## Not covered
 
-- The session logic that turns four-way commands into bootloader traffic, with its retries and waits (InitFlash trying the bootloader up to three times, DeviceWrite as set address, set buffer, payload, program, and so on).
-- The async runner over `embedded-io-async`, and the ESC-side line trait (select a line, read and write bytes, break all lines).
-- Entering and leaving the bootloader: holding the line high, the 2 s wait for the ESC to reset, the 20 ms break that sends it back to its application.
+- The session logic that turns four-way commands into bootloader traffic, with its retries and waits (InitFlash trying the bootloader up to three times, DeviceWrite as the client's `write`, and so on; the client only resyncs a line after a failed payload). The MSP and four-way side stays codecs: nothing here reads a host serial port.
+- The async runner over `embedded-io-async` for the host side. The ESC-side line trait exists; no implementation of it does (no board, no PIO).
+- Entering and leaving the bootloader: holding the line high, the 2 s wait for the ESC to reset, the 20 ms break that sends it back to its application. `set_break` is on the trait; nothing calls it.
 - Anything on a board: pins, PIO, the USB serial port, stopping the motor signal, the permission to take the lines.
-- Timing of any kind, including the bootloader's 5-bit-time limit between bytes.
-- The bootloader's page erase (`02 01`) and the four-way commands for devices other than the AM32 bootloader: the codes parse and encode, nothing answers them.
+- A timer: the client passes timeouts to the line and measures nothing. The bootloader's own limits (5 bit times between the bytes of a command, 250 us for a command without payload, 20 ms of line low) are the line implementation's business; neither the client nor the test simulator checks them.
+- The bootloader's page erase: the `02 01` command only checks the address, and the client's `erase` does nothing more. The four-way commands for devices other than the AM32 bootloader: the codes parse and encode, nothing answers them.
 - The opposite directions, for a computer-side tool: encoders for MSP and four-way requests, parsers for MSP and four-way replies, an encoder for the ESC's bootloader replies. Also MSP v2, MSP messages other than the five, and the configurator's "direct" route (one ESC, 19200 baud, its own bytes echoed).
-- Reading the settings block, the file name or the device-info block that the bootloader serves at its magic addresses.
+- Reading the settings block, the file name or the device-info block that the bootloader serves at its magic addresses: `read` reads any address, it does not interpret what comes back.
 
 ## Tests
 
 Host: `cargo test` (integration tests, proptests and the examples in this file, which are doctests). Each encoder and parser has golden vectors whose layout and source lines are cited next to them in `tests/msp.rs`, `tests/fourway.rs` and `tests/bootloader.rs`; the bytes were laid out by hand from the sources (the configurator's `four_way.ts`, `direct.ts` and `commands.queue.ts`, the npm package `@am32/serial-msp`, the bootloader's `main.c`, ArduPilot's behaviour) and their checksums computed with a separate script. The two CRCs are compared with bit-serial reference versions written in the tests and with the published check values for `"123456789"` (CRC16-XMODEM 0x31C3, CRC-16/ARC 0xBB3D). The proptests check that encoding then parsing round-trips (against independent decoders written in the tests), that parsing is the same however the stream is split, that arbitrary bytes never panic and that every frame a parser yields is one an independent whole-buffer parser also finds with a correct checksum, that a corrupted byte anywhere in a valid frame is rejected and the next frame still parses (the XOR checksum and the CRCs catch every single-byte change; a corrupted length byte is checked against the independent parser, because it can by chance make a different, correctly checksummed frame), and the reply parsers' prefixes, trailing bytes and corrupted bytes.
+
+The client is tested against a simulated bootloader in `tests/common/sim.rs` (up to four ESCs, each with a flash image), written from the bootloader's `main.c` and not from this crate's encoders, and checked on its own in `tests/simulator.rs` with hand-worked byte sequences. It models the init match, the device-info reply, set address with the magic addresses, set buffer without answer, the payload with its CRC check (and the wait for another payload after a bad one, which the client's resync answers), program (refused below the application and for a misaligned write on parts that demand it; a plain overwrite, with no page erase), erase, read (the address is forgotten), keep-alive, run (with the jump checks), the three acknowledges, the count of bad commands and the jump after 100. Its fault switches: no answer, a late answer, a truncated answer, a corrupted CRC, a wrong acknowledge, any replacement bytes, answers split into single bytes, a damaged request, an injected line error. Time in it is virtual. The client tests also check the exact bytes and the order and timeouts of the line calls, that they do not depend on the data, that every error variant is produced and the next operation then works, and with proptests that arbitrary bytes from the line never panic or pass for other data. The simulator and the `block_on` that drives the futures are test code only.
+
+The simulator and every timing here follow the AM32 bootloader source from v12 on. Older bootloaders exist in the field (the lead's bench controllers report bootloader version 1, whose source is not available), and nothing in this crate has been run against any real bootloader.
 
 ## Measured on a board
 
@@ -114,8 +186,8 @@ Feature `defmt` (off by default): `defmt::Format` for the public types.
 
 ```text
 Cargo.toml   the crate
-src/         msp.rs, fourway.rs, bootloader.rs, error.rs (EncodeError and the output writer)
-tests/       one file per module, and common/ with the bit-serial reference CRCs
+src/         msp.rs, fourway.rs, bootloader.rs, line.rs, client.rs, error.rs (EncodeError and the output writer)
+tests/       one file per module (client.rs for line and client), simulator.rs, and common/ with the bit-serial reference CRCs, the simulated bootloader (sim.rs) and block_on.rs
 ```
 
 MIT, see `LICENSE`.

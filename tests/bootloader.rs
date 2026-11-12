@@ -26,8 +26,9 @@ use common::ref_crc_arc;
 use esc_passthrough::EncodeError;
 use esc_passthrough::bootloader::{
     Ack, DeviceInfo, INIT, INIT_LEN, INIT_REPLY_LEN, MAX_DATA, ParseError, crc16, crc16_update,
-    encode_init, encode_keep_alive, encode_payload, encode_program, encode_read, encode_run,
-    encode_set_address, encode_set_buffer, parse_ack, parse_init_reply, parse_read_reply,
+    encode_erase, encode_init, encode_keep_alive, encode_payload, encode_program, encode_read,
+    encode_run, encode_set_address, encode_set_buffer, parse_ack, parse_init_reply,
+    parse_read_reply,
 };
 use proptest::prelude::*;
 
@@ -202,6 +203,19 @@ fn encode_program_writes_01_01_and_crc() {
     let mut small = [0u8; 3];
     assert_eq!(
         encode_program(&mut small),
+        Err(EncodeError::BufferTooSmall { needed: 4 })
+    );
+}
+
+#[test]
+fn encode_erase_writes_02_01_and_crc() {
+    // BL:753-769 (CMD_ERASE_FLASH 0x02, rxBuffer[1] is not looked at), AP:870-876 sends {02, 01};
+    // CRC 0xA0C0 (low byte first) worked out with a separate script.
+    assert_eq!(encoded(encode_erase), [0x02, 0x01, 0xC0, 0xA0]);
+    assert_eq!(encoded(encode_erase), with_crc(&[0x02, 0x01]));
+    let mut small = [0u8; 3];
+    assert_eq!(
+        encode_erase(&mut small),
         Err(EncodeError::BufferTooSmall { needed: 4 })
     );
 }

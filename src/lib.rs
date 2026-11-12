@@ -11,6 +11,14 @@
 //! - [`bootloader`]: the AM32 bootloader's host-to-ESC sequences, the parsers for its replies and
 //!   its CRC16.
 //!
+//! On top of the pure codecs, two modules do the one thing that needs I/O, without owning any:
+//!
+//! - [`mod@line`]: [`EscLines`](line::EscLines), the small trait a board implements for the ESCs'
+//!   single-wire lines (select one, write, read with a time limit, pull all low).
+//! - [`client`]: the async operations a flight controller performs on one ESC's line (connect,
+//!   read, write, erase, keep-alive, run), generic over `EscLines`, with typed errors and
+//!   configurable timeouts. It owns no timer and keeps no session.
+//!
 //! Payloads and addresses are opaque byte slices and `u16`s. Nothing here knows what any byte of
 //! an ESC's settings means.
 //!
@@ -37,8 +45,10 @@
 #![cfg_attr(not(test), deny(clippy::float_arithmetic))]
 
 pub mod bootloader;
+pub mod client;
 mod error;
 pub mod fourway;
+pub mod line;
 pub mod msp;
 
 pub use error::EncodeError;

@@ -14,9 +14,10 @@
 //! | [`encode_set_buffer`] | `FE 00` 0-or-1 length | nothing |
 //! | [`encode_payload`] | the payload, then its CRC | [`Ack`] |
 //! | [`encode_program`] | `01 01` | [`Ack`] |
+//! | [`encode_erase`] | `02 01` | [`Ack`]; the bootloader only checks the address and erases nothing |
 //! | [`encode_read`] | `03` n (0 means 256) | data, CRC, [`Ack`] ([`parse_read_reply`]) |
 //! | [`encode_keep_alive`] | `FD 00` | [`Ack::BadCommand`] on purpose |
-//! | [`encode_run`] | `00 00` | nothing; the ESC starts its application |
+//! | [`encode_run`] | `00 00` | `C1` or nothing, then the ESC starts its application (see [`encode_run`]) |
 
 use crate::EncodeError;
 use crate::error::Writer;
@@ -166,6 +167,17 @@ pub fn encode_program(out: &mut [u8]) -> Result<usize, EncodeError> {
     encode_with_crc(&[0x01, 0x01], out)
 }
 
+/// Writes erase: `02 01`, CRC (4 bytes). The ESC answers with an [`Ack`]: good if the address set
+/// before is at or above its application, [`Ack::BadCommand`] if not. The bootloader checks the
+/// address and erases nothing itself (`CMD_ERASE_FLASH` in the AM32 bootloader's `main.c`).
+///
+/// # Errors
+///
+/// [`EncodeError::BufferTooSmall`] if `out` is shorter than 4 bytes.
+pub fn encode_erase(out: &mut [u8]) -> Result<usize, EncodeError> {
+    encode_with_crc(&[0x02, 0x01], out)
+}
+
 /// Writes read: `03`, `n` (256 is sent as 0), CRC (4 bytes). The ESC answers with `n` bytes, their
 /// CRC and an [`Ack`] ([`parse_read_reply`]).
 ///
@@ -190,8 +202,10 @@ pub fn encode_keep_alive(out: &mut [u8]) -> Result<usize, EncodeError> {
     encode_with_crc(&[0xFD, 0x00], out)
 }
 
-/// Writes run: `00 00 00 00` (the two command bytes and their CRC, which is zero). The ESC does
-/// not answer; it starts its application.
+/// Writes run: `00 00 00 00` (the two command bytes and their CRC, which is zero). The ESC
+/// starts its application. The bootloader source from v12 on answers [`Ack::BadCommand`] (`C1`)
+/// before it jumps (it falls through to its bad-command answer); other bootloaders may send
+/// nothing. A caller must accept an answer or silence.
 ///
 /// # Errors
 ///
