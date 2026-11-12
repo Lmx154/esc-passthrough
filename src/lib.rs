@@ -19,6 +19,15 @@
 //!   read, write, erase, keep-alive, run), generic over `EscLines`, with typed errors and
 //!   configurable timeouts. It owns no timer and keeps no session.
 //!
+//! The host side, again without I/O:
+//!
+//! - [`mod@trigger`]: [`MspTrigger`](trigger::MspTrigger), which recognises the one MSP request
+//!   (`24 4D 3C 00 01 01`) that opens the configurator's conversation in a stream that carries other
+//!   traffic.
+//! - [`host`]: [`HostSide`](host::HostSide), which takes the bytes arriving from the configurator
+//!   and says what they ask for, answers the MSP requests that need no decision and builds the
+//!   four-way replies. It executes nothing on an ESC.
+//!
 //! Payloads and addresses are opaque byte slices and `u16`s. Nothing here knows what any byte of
 //! an ESC's settings means.
 //!
@@ -48,8 +57,10 @@ pub mod bootloader;
 pub mod client;
 mod error;
 pub mod fourway;
+pub mod host;
 pub mod line;
 pub mod msp;
+pub mod trigger;
 
 pub use error::EncodeError;
 
