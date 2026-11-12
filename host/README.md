@@ -11,10 +11,14 @@ AM32 configurator does:
   back. It exists to prove that a write through the passthrough works. It is built only with the cargo
   feature `write`.
 
-**Status:** `esc-passthrough-host` has been run against the real board (the four controllers were read).
-**`esc-passthrough-restore` has so far been run only against the fake board** (the `esc-passthrough`
-crate's session and its simulated bootloaders, joined to the tool by in-memory pipes; `tests/restore.rs`).
-No test opens a serial port.
+**Status:** both tools have been run against the real board with four AM32 2.20 controllers (bootloader
+version 1) behind it, on 2026-11-12. `esc-passthrough-host` read the four settings blocks and dumped
+0x1000 to 0x7FFF of each controller, before and after a firmware flash done with the real configurator;
+the dump after the flash was compared byte for byte with the release's hex file.
+`esc-passthrough-restore` wrote each controller's own block back unchanged and verified it, on all four.
+**It has not been used on hardware to write a changed block** (`--allow-change`). The cargo tests open
+no serial port: they join the tools by in-memory pipes to a fake board (the `esc-passthrough` crate's
+session and its simulated bootloaders; `tests/restore.rs`).
 
 ## Build
 
@@ -119,7 +123,8 @@ with `FILE`.
   written again, at most twice more (three writes in all); a write is never retried by the retry rule on
   silence, because whether it took effect is then unknown.
 - Passthrough is always left at the end (interface-exit), and the last line, starting `FINAL:`, states
-  plainly what was written to which controller.
+  plainly what was written to which controller. When every write was answered with an error it says
+  `NO WRITE ACCEPTED` and whether the block read afterwards equals the block read before the writes.
 
 ### Exit status
 
