@@ -1,0 +1,18 @@
+[package]
+name = "esc-passthrough-host"
+description = "Computer side bench tool: reads the settings of the motor controllers behind a flight controller's AM32 passthrough, the way the configurator does, and never writes. Run it as described in README.md."
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+
+[dependencies]
+serialport = "4.10.1"
+
+[dev-dependencies]
+# The flight-controller side, used only by tests/fake_board.rs as the other end of an in-memory wire.
+esc-passthrough = { path = ".." }
+embedded-hal-async = "1.0"
+embedded-io-async = "0.7"
+
+[workspace]
