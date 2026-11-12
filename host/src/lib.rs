@@ -6,7 +6,9 @@
 //! tool and does not use the `esc-passthrough` crate, which has only the flight-controller side.
 //!
 //! READ-ONLY: every request the tool can send is a variant of [`msp::Request`] or
-//! [`fourway::Request`]; neither has a write, erase or reset.
+//! [`fourway::Request`]; neither has a write, erase or reset. The one write-capable module is
+//! `write`, compiled only with the cargo feature `write` (for the `esc-passthrough-restore`
+//! binary); a default build does not contain it.
 #![forbid(unsafe_code)]
 #![cfg_attr(
     not(test),
@@ -24,3 +26,5 @@ pub mod link;
 pub mod msp;
 pub mod port;
 pub mod tool;
+#[cfg(feature = "write")]
+pub mod write;

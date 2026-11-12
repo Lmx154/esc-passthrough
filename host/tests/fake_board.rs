@@ -9,288 +9,12 @@
 //!
 //! No serial port is opened anywhere in this file.
 
-use embedded_hal_async::delay::DelayNs;
-use embedded_io_async::{ErrorKind, ErrorType, Read, Write};
-use esc_passthrough::msp::BatteryState;
-use esc_passthrough::session::{Exit, Lender, Passthrough, SessionConfig};
-use esc_passthrough_host::link::Link;
-use esc_passthrough_host::tool::{self, Comparison, Options, Report, Timing};
-use std::collections::VecDeque;
-use std::future::Future;
-use std::io;
-use std::pin::pin;
-use std::sync::{Arc, Condvar, Mutex};
-use std::task::{Context, Poll, Wake, Waker};
-use std::thread::{self, JoinHandle};
-use std::time::Duration;
+mod common;
 
-#[path = "../../tests/common/sim.rs"]
-#[allow(clippy::all)]
-mod sim;
-
-use sim::{EscModel, Fault, Sim, Wire};
-
-const BLOCK_AT: usize = 0x7C00;
-const BLOCK_LEN: usize = 184;
-
-// ---------------------------------------------------------------- the wire
-
-#[derive(Default)]
-struct State {
-    bytes: VecDeque<u8>,
-    closed: bool,
-    waker: Option<Waker>,
-}
-
-#[derive(Default)]
-struct Pipe {
-    state: Mutex<State>,
-    ready: Condvar,
-}
-
-impl Pipe {
-    fn push(&self, bytes: &[u8]) {
-        let mut state = self.state.lock().unwrap();
-        state.bytes.extend(bytes);
-        if let Some(waker) = state.waker.take() {
-            waker.wake();
-        }
-        self.ready.notify_all();
-    }
-
-    fn close(&self) {
-        let mut state = self.state.lock().unwrap();
-        state.closed = true;
-        if let Some(waker) = state.waker.take() {
-            waker.wake();
-        }
-        self.ready.notify_all();
-    }
-}
-
-/// The tool's end: writes go to the board, reads wait on the pipe with a time limit.
-struct ToolEnd {
-    to_board: Arc<Pipe>,
-    from_board: Arc<Pipe>,
-    sent: Vec<Vec<u8>>,
-}
-
-impl Link for ToolEnd {
-    fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
-        self.sent.push(bytes.to_vec());
-        self.to_board.push(bytes);
-        Ok(())
-    }
-
-    fn read_some(&mut self, buf: &mut [u8], timeout: Duration) -> io::Result<usize> {
-        let mut state = self.from_board.state.lock().unwrap();
-        let deadline = std::time::Instant::now() + timeout;
-        while state.bytes.is_empty() {
-            if state.closed {
-                return Ok(0);
-            }
-            let left = deadline.saturating_duration_since(std::time::Instant::now());
-            if left.is_zero() {
-                return Err(io::ErrorKind::TimedOut.into());
-            }
-            state = self.from_board.ready.wait_timeout(state, left).unwrap().0;
-        }
-        let n = buf.len().min(state.bytes.len());
-        for slot in buf.iter_mut().take(n) {
-            *slot = state.bytes.pop_front().unwrap_or_default();
-        }
-        Ok(n)
-    }
-
-    fn discard_input(&mut self) -> io::Result<()> {
-        self.from_board.state.lock().unwrap().bytes.clear();
-        Ok(())
-    }
-}
-
-impl Drop for ToolEnd {
-    fn drop(&mut self) {
-        self.to_board.close();
-    }
-}
-
-/// The board's receiving half: cancel-safe (a pending read has taken nothing).
-struct BoardRx(Arc<Pipe>);
-/// The board's sending half.
-struct BoardTx(Arc<Pipe>);
-
-impl Drop for BoardTx {
-    fn drop(&mut self) {
-        self.0.close();
-    }
-}
-
-impl ErrorType for BoardRx {
-    type Error = ErrorKind;
-}
-impl ErrorType for BoardTx {
-    type Error = ErrorKind;
-}
-
-impl Read for BoardRx {
-    async fn read(&mut self, buf: &mut [u8]) -> Result<usize, ErrorKind> {
-        std::future::poll_fn(|cx| {
-            let mut state = self.0.state.lock().unwrap();
-            if !state.bytes.is_empty() {
-                let n = buf.len().min(state.bytes.len());
-                for slot in buf.iter_mut().take(n) {
-                    *slot = state.bytes.pop_front().unwrap_or_default();
-                }
-                Poll::Ready(Ok(n))
-            } else if state.closed {
-                Poll::Ready(Ok(0))
-            } else {
-                state.waker = Some(cx.waker().clone());
-                Poll::Pending
-            }
-        })
-        .await
-    }
-}
-
-impl Write for BoardTx {
-    async fn write(&mut self, buf: &[u8]) -> Result<usize, ErrorKind> {
-        self.0.push(buf);
-        Ok(buf.len())
-    }
-
-    async fn flush(&mut self) -> Result<(), ErrorKind> {
-        Ok(())
-    }
-}
-
-// ---------------------------------------------------------------- the board's thread
-
-struct ThreadWaker(thread::Thread);
-
-impl Wake for ThreadWaker {
-    fn wake(self: Arc<Self>) {
-        self.0.unpark();
-    }
-}
-
-/// Runs `future` on this thread, parking while it is pending. Gives up after 60 s without end.
-fn block_on<F: Future>(future: F) -> F::Output {
-    let waker = Waker::from(Arc::new(ThreadWaker(thread::current())));
-    let mut cx = Context::from_waker(&waker);
-    let mut future = pin!(future);
-    let started = std::time::Instant::now();
-    loop {
-        if let Poll::Ready(value) = future.as_mut().poll(&mut cx) {
-            return value;
-        }
-        assert!(
-            started.elapsed() < Duration::from_secs(60),
-            "the fake board hangs"
-        );
-        thread::park_timeout(Duration::from_millis(50));
-    }
-}
-
-/// Returns at once for a zero delay and never for any other.
-struct FakeDelay;
-
-impl DelayNs for FakeDelay {
-    async fn delay_ns(&mut self, ns: u32) {
-        if ns > 0 {
-            std::future::pending::<()>().await;
-        }
-    }
-}
-
-struct FakeLender {
-    sim: Option<Sim>,
-    grant: bool,
-}
-
-impl Lender for FakeLender {
-    type Lines = Sim;
-
-    async fn lend(&mut self) -> Option<Sim> {
-        if self.grant { self.sim.take() } else { None }
-    }
-}
-
-struct Finished {
-    exit: Exit<ErrorKind>,
-    sim: Sim,
-}
-
-struct Board {
-    handle: JoinHandle<Finished>,
-    tool: ToolEnd,
-}
-
-/// Starts the board with `sim` as its controllers' lines and returns the tool's end of the wire.
-fn start_board(sim: Sim, grant: bool, esc_count: u8) -> Board {
-    let to_board = Arc::new(Pipe::default());
-    let from_board = Arc::new(Pipe::default());
-    let (rx, tx) = (BoardRx(to_board.clone()), BoardTx(from_board.clone()));
-    let handle = thread::spawn(move || {
-        let (mut rx, mut tx) = (rx, tx);
-        let config = SessionConfig::new()
-            .with_esc_count(esc_count)
-            .with_park_ms(0)
-            .with_break_ms(0)
-            .with_idle_ms(60_000);
-        let mut session = Passthrough::<Sim>::new(config);
-        let mut lender = FakeLender {
-            sim: Some(sim),
-            grant,
-        };
-        let exit =
-            block_on(
-                session.run(&[], &mut rx, &mut tx, &mut lender, &mut FakeDelay, || {
-                    BatteryState::new(25_200)
-                }),
-            );
-        let sim = session
-            .release()
-            .ok()
-            .or(lender.sim.take())
-            .expect("the sim is back");
-        Finished { exit, sim }
-    });
-    Board {
-        handle,
-        tool: ToolEnd {
-            to_board,
-            from_board,
-            sent: Vec::new(),
-        },
-    }
-}
-
-fn four_controllers() -> Sim {
-    let mut sim = Sim::four();
-    for line in 0..4 {
-        let flash = sim.esc_mut(line).flash_mut();
-        for (i, byte) in flash[BLOCK_AT..BLOCK_AT + BLOCK_LEN].iter_mut().enumerate() {
-            *byte = match i {
-                0 => 1,
-                i => (i as u8).wrapping_mul(7).wrapping_add(line as u8 * 31 + 5),
-            };
-        }
-    }
-    sim
-}
-
-fn block_of(sim: &Sim, line: usize) -> Vec<u8> {
-    sim.esc(line).flash()[BLOCK_AT..BLOCK_AT + BLOCK_LEN].to_vec()
-}
-
-fn quick() -> Timing {
-    Timing {
-        after_passthrough: Duration::ZERO,
-        retry_delay: Duration::ZERO,
-        ..Timing::configurator()
-    }
-}
+use common::sim::{EscModel, Fault, Sim, Wire};
+use common::{Board, Finished, block_of, flashes, four_controllers, quick, start_board};
+use esc_passthrough::session::Exit;
+use esc_passthrough_host::tool::{self, Comparison, Options, Report};
 
 fn options() -> Options {
     Options {
@@ -308,10 +32,6 @@ fn session(sim: Sim, grant: bool, options: &Options) -> (Report, String, Vec<Vec
     drop(tool);
     let finished = handle.join().expect("the board thread ended");
     (report, String::from_utf8(out).unwrap(), sent, finished)
-}
-
-fn flashes(sim: &Sim) -> Vec<Vec<u8>> {
-    (0..4).map(|line| sim.esc(line).flash().to_vec()).collect()
 }
 
 // ---------------------------------------------------------------- the proof
@@ -571,4 +291,167 @@ fn a_single_controller_board_is_read_with_the_default_count() {
     assert_eq!(report.escs.len(), 1);
     assert_eq!(report.escs[0].pin_code, Some(0x14));
     assert_eq!(finished.sim.esc(0).flash(), before);
+}
+
+// ---------------------------------------------------------------- --dump
+
+#[test]
+fn a_dump_spanning_several_chunks_equals_the_simulators_image() {
+    let sim = four_controllers();
+    // 700 bytes at 0x1000: chunks of 256, 256 and 188 bytes.
+    let images: Vec<Vec<u8>> = (0..4)
+        .map(|line| sim.esc(line).flash()[0x1000..0x1000 + 700].to_vec())
+        .collect();
+    let before = flashes(&sim);
+    let dump = tool::Dump {
+        start: 0x1000,
+        length: 700,
+    };
+    let (report, text, sent, finished) = session(
+        sim,
+        true,
+        &Options {
+            dump: Some(dump),
+            ..options()
+        },
+    );
+    assert_eq!(report.status(), 0, "{text}");
+    for (line, esc) in report.escs.iter().enumerate() {
+        assert_eq!(
+            esc.dump.as_deref(),
+            Some(&images[line][..]),
+            "controller {line}"
+        );
+    }
+    assert!(
+        text.contains("dump: 700 bytes at 0x1000 in 3 chunk(s)"),
+        "{text}"
+    );
+    assert!(text.contains("dump: 700 bytes in "), "{text}");
+    // Only reads: per controller init, settings read, three chunk reads; then the exit.
+    let commands: Vec<u8> = sent
+        .iter()
+        .map(|frame| if frame[0] == b'$' { frame[4] } else { frame[1] })
+        .collect();
+    let mut expected = vec![1, 2, 130, 131, 245];
+    for _ in 0..4 {
+        expected.extend([0x37, 0x3A, 0x3A, 0x3A, 0x3A]);
+    }
+    expected.push(0x34);
+    assert_eq!(commands, expected);
+    assert_eq!(flashes(&finished.sim), before);
+
+    // The files are named after the range.
+    let dir = std::env::temp_dir().join(format!("esc-host-dump-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let paths = tool::save_dumps(&dir, &report, dump).unwrap();
+    assert_eq!(paths.len(), 4);
+    assert_eq!(
+        paths[1].file_name().unwrap().to_str().unwrap(),
+        "esc2-flash-0x1000-0x02bc.bin"
+    );
+    assert_eq!(std::fs::read(&paths[1]).unwrap(), images[1]);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn a_dump_prints_progress_every_sixteen_chunks_and_the_total_time() {
+    let sim = Sim::new(vec![EscModel::f421(0x14)]);
+    let image = sim.esc(0).flash()[0x1000..0x1000 + 8192].to_vec();
+    let Board { handle, mut tool } = start_board(sim, true, 1);
+    let mut out = Vec::new();
+    let options = Options {
+        dump: Some(tool::Dump {
+            start: 0x1000,
+            length: 8192,
+        }),
+        ..options()
+    };
+    let report = tool::run(&mut tool, &options, &mut out);
+    drop(tool);
+    handle.join().unwrap();
+    let text = String::from_utf8(out).unwrap();
+    assert_eq!(report.status(), 0, "{text}");
+    assert_eq!(report.escs[0].dump.as_deref(), Some(&image[..]));
+    assert!(
+        text.contains("dump: 16 of 32 chunks, 4096 of 8192 bytes"),
+        "{text}"
+    );
+    assert!(
+        text.contains("dump: 32 of 32 chunks, 8192 of 8192 bytes"),
+        "{text}"
+    );
+    assert_eq!(text.matches(" of 32 chunks, ").count(), 2, "{text}");
+}
+
+#[test]
+fn a_refused_chunk_is_reported_with_its_address_and_the_file_is_not_written() {
+    // Addresses below 0x400 are refused by the simulated bootloader.
+    let dump = tool::Dump {
+        start: 0x0300,
+        length: 0x200,
+    };
+    let (report, text, _, finished) = session(
+        four_controllers(),
+        true,
+        &Options {
+            dump: Some(dump),
+            ..options()
+        },
+    );
+    assert_eq!(report.status(), 1, "{text}");
+    for esc in &report.escs {
+        assert!(esc.dump.is_none());
+        assert!(esc.block.is_some(), "the settings block was still read");
+        assert!(
+            esc.error
+                .as_deref()
+                .unwrap_or("")
+                .contains("chunk 1 of 2 at address 0x0300"),
+            "{esc:?}"
+        );
+    }
+    assert!(
+        text.contains("dump failed: chunk 1 of 2 at address 0x0300"),
+        "{text}"
+    );
+    let dir = std::env::temp_dir().join(format!("esc-host-nodump-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    assert!(tool::save_dumps(&dir, &report, dump).unwrap().is_empty());
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+    std::fs::remove_dir_all(&dir).unwrap();
+    assert_eq!(finished.exit, Exit::Exited);
+}
+
+#[test]
+fn a_dump_that_fails_for_one_controller_leaves_the_others_dumped() {
+    let mut sim = four_controllers();
+    // Controller 2 answers its init and settings read (3 answers), then nothing.
+    sim.faults(
+        1,
+        std::iter::repeat_n(Fault::Pass, 3).chain(std::iter::repeat_n(Fault::NoAnswer, 200)),
+    );
+    let dump = tool::Dump {
+        start: 0x1000,
+        length: 300,
+    };
+    let (report, text, _, _) = session(
+        sim,
+        true,
+        &Options {
+            dump: Some(dump),
+            ..options()
+        },
+    );
+    assert_eq!(report.status(), 1, "{text}");
+    assert!(report.escs[0].dump.is_some());
+    assert!(report.escs[1].dump.is_none());
+    assert!(
+        report.escs[1]
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("chunk 1 of 2 at address 0x1000")
+    );
+    assert!(report.escs[2].dump.is_some() && report.escs[3].dump.is_some());
 }

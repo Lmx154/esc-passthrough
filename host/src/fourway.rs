@@ -280,10 +280,19 @@ impl Reply {
     ///
     /// [`CheckError`].
     pub fn check(&self, request: &Request) -> Result<(), CheckError> {
-        if self.command != request.command() || self.address != request.address() {
+        self.check_echo(request.command(), request.address())
+    }
+
+    /// The same check for a request given by its command number and address.
+    ///
+    /// # Errors
+    ///
+    /// [`CheckError`].
+    pub fn check_echo(&self, command: u8, address: u16) -> Result<(), CheckError> {
+        if self.command != command || self.address != address {
             return Err(CheckError::Stale {
                 got: (self.command, self.address),
-                wanted: (request.command(), request.address()),
+                wanted: (command, address),
             });
         }
         if self.ack != 0 {

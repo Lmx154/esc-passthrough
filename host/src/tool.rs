@@ -84,6 +84,15 @@ impl Default for Timing {
     }
 }
 
+/// A flash range to dump: wire addresses `start` to `start + length - 1`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Dump {
+    /// First wire address.
+    pub start: u16,
+    /// Bytes, 1 to `0x10000 - start`.
+    pub length: u32,
+}
+
 /// What to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Options {
@@ -97,6 +106,8 @@ pub struct Options {
     pub compare: Vec<Vec<u8>>,
     /// Leave the board in four-way mode at the end.
     pub no_exit: bool,
+    /// A flash range to read from every controller after its settings block.
+    pub dump: Option<Dump>,
     /// Waits.
     pub timing: Timing,
 }
@@ -111,6 +122,7 @@ impl Options {
             length: 184,
             compare: Vec::new(),
             no_exit: false,
+            dump: None,
             timing: Timing::configurator(),
         }
     }
@@ -169,6 +181,8 @@ pub struct EscReport {
     pub error: Option<String>,
     /// The comparison with the file given for it.
     pub comparison: Comparison,
+    /// The flash range read for `--dump`.
+    pub dump: Option<Vec<u8>>,
 }
 
 /// Everything a run found.
@@ -197,7 +211,7 @@ pub struct Report {
 }
 
 impl Report {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             api_version: None,
             variant: None,
@@ -239,11 +253,11 @@ macro_rules! say {
     }};
 }
 
-fn ms(d: Duration) -> f64 {
+pub(crate) fn ms(d: Duration) -> f64 {
     d.as_secs_f64() * 1000.0
 }
 
-fn pause(d: Duration) {
+pub(crate) fn pause(d: Duration) {
     if !d.is_zero() {
         thread::sleep(d);
     }
@@ -252,121 +266,15 @@ fn pause(d: Duration) {
 /// Runs the sequence on `link`, printing what happens to `out`.
 pub fn run<L: Link + ?Sized>(link: &mut L, options: &Options, out: &mut dyn Write) -> Report {
     let mut report = Report::new();
-    let timing = options.timing;
-    let _ = link.discard_input();
-
-    // SerialDevice.vue:618-653: the four MSP requests.
-    let Some(api) = first_request(link, &timing, out) else {
-        report.failure = Some("the board did not answer MSP_API_VERSION".into());
+    let Some(count) = enter_passthrough(link, options, out, &mut report) else {
         return report;
     };
-    if let [protocol, major, minor, ..] = api[..] {
-        report.api_version = Some([protocol, major, minor]);
-        say!(
-            out,
-            "board: protocol {protocol}, API version {major}.{minor}"
-        );
-    } else {
-        say!(
-            out,
-            "board: MSP_API_VERSION payload has only {} bytes",
-            api.len()
-        );
-    }
-    let Some(variant) = msp_data(link, msp::Request::FcVariant, &timing, out, &mut report) else {
-        return report;
-    };
-    let text = String::from_utf8_lossy(variant.get(..4).unwrap_or(&variant)).into_owned();
-    say!(out, "board: flight controller variant {text:?}");
-    report.variant = Some(text);
-    let Some(battery) = msp_data(link, msp::Request::BatteryState, &timing, out, &mut report)
-    else {
-        return report;
-    };
-    match battery.get(3) {
-        Some(&tenths) if battery.len() >= 8 => {
-            report.battery_decivolts = Some(tenths);
-            say!(out, "board: battery {:.1} V", f64::from(tenths) / 10.0);
-        }
-        _ => {
-            report.failure = Some(format!(
-                "MSP_BATTERY_STATE payload has {} bytes, the configurator needs at least 8",
-                battery.len()
-            ));
-            say!(
-                out,
-                "board: {}",
-                report.failure.as_deref().unwrap_or_default()
-            );
-            return report;
-        }
-    }
-    let Some(motors) = msp_data(link, msp::Request::MotorConfig, &timing, out, &mut report) else {
-        return report;
-    };
-    let Some(&motor_count) = motors.get(6) else {
-        report.failure = Some(format!(
-            "MSP_MOTOR_CONFIG payload has {} bytes, the motor count is at byte 6",
-            motors.len()
-        ));
-        say!(
-            out,
-            "board: {}",
-            report.failure.as_deref().unwrap_or_default()
-        );
-        return report;
-    };
-    report.motor_count = Some(motor_count);
-    say!(out, "board: motor count {motor_count}");
-
-    // SerialDevice.vue:655-661.
-    let count = match request_msp(link, msp::Request::SetPassthrough, &timing, out) {
-        Ok(msp::Reply::Refused) => {
-            report.passthrough = Passthrough::Refused;
-            say!(
-                out,
-                "passthrough: REFUSED by the board (MSP error reply); nothing was changed"
-            );
-            return report;
-        }
-        Ok(msp::Reply::Data(data)) => match data.first() {
-            Some(&count) => count,
-            None => {
-                report.failure =
-                    Some("MSP_SET_PASSTHROUGH reply carries no controller count".into());
-                say!(
-                    out,
-                    "passthrough: {}",
-                    report.failure.as_deref().unwrap_or_default()
-                );
-                best_effort_exit(link, options, out, &mut report);
-                return report;
-            }
-        },
-        Err(error) => {
-            report.failure = Some(format!("MSP_SET_PASSTHROUGH: {error}"));
-            say!(out, "passthrough: {error}");
-            best_effort_exit(link, options, out, &mut report);
-            return report;
-        }
-    };
-    report.passthrough = Passthrough::Granted(count);
-    say!(
-        out,
-        "passthrough: granted, the board reports {count} controllers"
-    );
     let visit = options.escs.unwrap_or(count);
     if let Some(forced) = options.escs
         && forced != count
     {
         say!(out, "note: --escs {forced} overrides the board's {count}");
     }
-    say!(
-        out,
-        "waiting {:.0} ms before the first four-way request (SerialDevice.vue:657)",
-        ms(timing.after_passthrough)
-    );
-    pause(timing.after_passthrough);
     if visit == 0 {
         report.failure = Some("the board reports 0 controllers".into());
         say!(
@@ -398,6 +306,121 @@ pub fn run<L: Link + ?Sized>(link: &mut L, options: &Options, out: &mut dyn Writ
         send_exit(link, options, out, &mut report);
     }
     report
+}
+
+/// The configurator's opening: the four MSP requests, `MSP_SET_PASSTHROUGH`, and the wait before
+/// four-way (`SerialDevice.vue:618-661`). Returns the controller count the board reported once
+/// four-way requests may be sent; `None` when the sequence stopped (the reason is in `report`:
+/// a failure, or `passthrough == Refused`).
+pub fn enter_passthrough<L: Link + ?Sized>(
+    link: &mut L,
+    options: &Options,
+    out: &mut dyn Write,
+    report: &mut Report,
+) -> Option<u8> {
+    let timing = options.timing;
+    let _ = link.discard_input();
+
+    // SerialDevice.vue:618-653: the four MSP requests.
+    let Some(api) = first_request(link, &timing, out) else {
+        report.failure = Some("the board did not answer MSP_API_VERSION".into());
+        return None;
+    };
+    if let [protocol, major, minor, ..] = api[..] {
+        report.api_version = Some([protocol, major, minor]);
+        say!(
+            out,
+            "board: protocol {protocol}, API version {major}.{minor}"
+        );
+    } else {
+        say!(
+            out,
+            "board: MSP_API_VERSION payload has only {} bytes",
+            api.len()
+        );
+    }
+    let variant = msp_data(link, msp::Request::FcVariant, &timing, out, report)?;
+    let text = String::from_utf8_lossy(variant.get(..4).unwrap_or(&variant)).into_owned();
+    say!(out, "board: flight controller variant {text:?}");
+    report.variant = Some(text);
+    let battery = msp_data(link, msp::Request::BatteryState, &timing, out, report)?;
+    match battery.get(3) {
+        Some(&tenths) if battery.len() >= 8 => {
+            report.battery_decivolts = Some(tenths);
+            say!(out, "board: battery {:.1} V", f64::from(tenths) / 10.0);
+        }
+        _ => {
+            report.failure = Some(format!(
+                "MSP_BATTERY_STATE payload has {} bytes, the configurator needs at least 8",
+                battery.len()
+            ));
+            say!(
+                out,
+                "board: {}",
+                report.failure.as_deref().unwrap_or_default()
+            );
+            return None;
+        }
+    }
+    let motors = msp_data(link, msp::Request::MotorConfig, &timing, out, report)?;
+    let Some(&motor_count) = motors.get(6) else {
+        report.failure = Some(format!(
+            "MSP_MOTOR_CONFIG payload has {} bytes, the motor count is at byte 6",
+            motors.len()
+        ));
+        say!(
+            out,
+            "board: {}",
+            report.failure.as_deref().unwrap_or_default()
+        );
+        return None;
+    };
+    report.motor_count = Some(motor_count);
+    say!(out, "board: motor count {motor_count}");
+
+    // SerialDevice.vue:655-661.
+    let count = match request_msp(link, msp::Request::SetPassthrough, &timing, out) {
+        Ok(msp::Reply::Refused) => {
+            report.passthrough = Passthrough::Refused;
+            say!(
+                out,
+                "passthrough: REFUSED by the board (MSP error reply); nothing was changed"
+            );
+            return None;
+        }
+        Ok(msp::Reply::Data(data)) => match data.first() {
+            Some(&count) => count,
+            None => {
+                report.failure =
+                    Some("MSP_SET_PASSTHROUGH reply carries no controller count".into());
+                say!(
+                    out,
+                    "passthrough: {}",
+                    report.failure.as_deref().unwrap_or_default()
+                );
+                best_effort_exit(link, options, out, report);
+                return None;
+            }
+        },
+        Err(error) => {
+            report.failure = Some(format!("MSP_SET_PASSTHROUGH: {error}"));
+            say!(out, "passthrough: {error}");
+            best_effort_exit(link, options, out, report);
+            return None;
+        }
+    };
+    report.passthrough = Passthrough::Granted(count);
+    say!(
+        out,
+        "passthrough: granted, the board reports {count} controllers"
+    );
+    say!(
+        out,
+        "waiting {:.0} ms before the first four-way request (SerialDevice.vue:657)",
+        ms(timing.after_passthrough)
+    );
+    pause(timing.after_passthrough);
+    Some(count)
 }
 
 /// MSP_API_VERSION with the configurator's recovery (`SerialDevice.vue:618-629`).
@@ -506,8 +529,67 @@ fn visit_esc<L: Link + ?Sized>(
         esc.error = Some("controller index does not fit a byte".into());
         return esc;
     };
+    let params = match init_esc(link, timing, channel, out) {
+        Ok(params) => params,
+        Err(error) => {
+            say!(out, "  init-flash failed: {error}");
+            esc.error = Some(format!("init-flash: {error}"));
+            return esc;
+        }
+    };
+    let [low, high, pin, mode] = params;
+    let signature = u16::from_be_bytes([high, low]);
+    esc.signature = Some(signature);
+    esc.pin_code = Some(pin);
+    esc.interface_mode = Some(mode);
+    say!(
+        out,
+        "  signature 0x{signature:04X}, pin code 0x{pin:02X}, interface mode {mode} (reply bytes {low:02X} {high:02X} {pin:02X} {mode:02X})"
+    );
+
+    match read_range(link, timing, options.address, options.length, out) {
+        Ok(block) => {
+            say!(
+                out,
+                "  settings block, {} bytes at 0x{:04X}:",
+                block.len(),
+                options.address
+            );
+            hex_dump(out, &block);
+            if let Some(expected) = options.compare.get(index) {
+                esc.comparison = compare(&block, expected);
+                report_comparison(out, &esc.comparison);
+            }
+            esc.block = Some(block);
+        }
+        Err(error) => {
+            say!(out, "  read failed: {error}");
+            esc.error = Some(format!("read: {error}"));
+            return esc;
+        }
+    }
+    if let Some(dump) = options.dump {
+        match dump_range(link, timing, dump, out) {
+            Ok(bytes) => esc.dump = Some(bytes),
+            Err(error) => {
+                say!(out, "  dump failed: {error}");
+                esc.error = Some(format!("dump: {error}"));
+            }
+        }
+    }
+    esc
+}
+
+/// Init-flash for controller `channel` (0-based) with the configurator's retry rule. Returns the
+/// four reply parameters: signature low, signature high, pin code, interface mode.
+pub fn init_esc<L: Link + ?Sized>(
+    link: &mut L,
+    timing: &Timing,
+    channel: u8,
+    out: &mut dyn Write,
+) -> Result<[u8; 4], String> {
     let init = fourway::Request::InitFlash { esc: channel };
-    let init_reply = with_retries(link, &init, timing.init_timeout, timing, out, &|reply| {
+    let reply = with_retries(link, &init, timing.init_timeout, timing, out, &|reply| {
         if reply.params.len() == 4 {
             Ok(())
         } else {
@@ -516,63 +598,101 @@ fn visit_esc<L: Link + ?Sized>(
                 reply.params.len()
             ))
         }
-    });
-    let reply = match init_reply {
-        Ok(reply) => reply,
-        Err(error) => {
-            say!(out, "  init-flash failed: {error}");
-            esc.error = Some(format!("init-flash: {error}"));
-            return esc;
-        }
-    };
-    if let [low, high, pin, mode] = reply.params[..] {
-        let signature = u16::from_be_bytes([high, low]);
-        esc.signature = Some(signature);
-        esc.pin_code = Some(pin);
-        esc.interface_mode = Some(mode);
-        say!(
-            out,
-            "  signature 0x{signature:04X}, pin code 0x{pin:02X}, interface mode {mode} (reply bytes {low:02X} {high:02X} {pin:02X} {mode:02X})"
-        );
+    })?;
+    match reply.params[..] {
+        [low, high, pin, mode] => Ok([low, high, pin, mode]),
+        _ => Err("init reply is not 4 bytes".into()),
     }
+}
 
-    let read = fourway::Request::DeviceRead {
-        address: options.address,
-        length: options.length,
-    };
-    let wanted = usize::from(options.length);
-    let timeout = timing.read_timeout(wanted);
-    let read_reply = with_retries(link, &read, timeout, timing, out, &|reply| {
-        if reply.params.len() == wanted {
-            Ok(())
-        } else {
-            Err(format!(
-                "read reply has {} bytes, asked for {wanted}",
-                reply.params.len()
-            ))
+/// One device-read of `length` bytes (1 to 256) at the wire `address` with the configurator's
+/// retry rule and read wait.
+pub fn read_range<L: Link + ?Sized>(
+    link: &mut L,
+    timing: &Timing,
+    address: u16,
+    length: u16,
+    out: &mut dyn Write,
+) -> Result<Vec<u8>, String> {
+    let read = fourway::Request::DeviceRead { address, length };
+    let wanted = usize::from(length);
+    let reply = with_retries(
+        link,
+        &read,
+        timing.read_timeout(wanted),
+        timing,
+        out,
+        &|reply| {
+            if reply.params.len() == wanted {
+                Ok(())
+            } else {
+                Err(format!(
+                    "read reply has {} bytes, asked for {wanted}",
+                    reply.params.len()
+                ))
+            }
+        },
+    )?;
+    Ok(reply.params)
+}
+
+/// Chunks of a dump: the largest device-read.
+const DUMP_CHUNK: u32 = 256;
+
+/// Reads `dump` in chunks of at most 256 bytes, each with the retry rule. A chunk that cannot be
+/// read ends the dump with an error that names its address.
+fn dump_range<L: Link + ?Sized>(
+    link: &mut L,
+    timing: &Timing,
+    dump: Dump,
+    out: &mut dyn Write,
+) -> Result<Vec<u8>, String> {
+    let started = std::time::Instant::now();
+    let chunks = dump.length.div_ceil(DUMP_CHUNK);
+    say!(
+        out,
+        "  dump: {} bytes at 0x{:04X} in {chunks} chunk(s)",
+        dump.length,
+        dump.start
+    );
+    let mut bytes = Vec::with_capacity(dump.length as usize);
+    for chunk in 0..chunks {
+        let offset = chunk * DUMP_CHUNK;
+        let length = (dump.length - offset).min(DUMP_CHUNK);
+        let address = u16::try_from(u32::from(dump.start) + offset).map_err(|_| {
+            format!(
+                "chunk at 0x{:X} is beyond the 16-bit address",
+                u32::from(dump.start) + offset
+            )
+        })?;
+        let length16 = u16::try_from(length).map_err(|_| "chunk length".to_string())?;
+        match read_range(link, timing, address, length16, out) {
+            Ok(data) => bytes.extend_from_slice(&data),
+            Err(error) => {
+                return Err(format!(
+                    "chunk {} of {chunks} at address 0x{address:04X} ({length} bytes) refused or lost: {error}",
+                    chunk + 1
+                ));
+            }
         }
-    });
-    match read_reply {
-        Ok(reply) => {
+        if (chunk + 1) % 16 == 0 {
             say!(
                 out,
-                "  settings block, {} bytes at 0x{:04X}:",
-                reply.params.len(),
-                options.address
+                "  dump: {} of {chunks} chunks, {} of {} bytes, {:.1} s",
+                chunk + 1,
+                bytes.len(),
+                dump.length,
+                started.elapsed().as_secs_f64()
             );
-            hex_dump(out, &reply.params);
-            if let Some(expected) = options.compare.get(index) {
-                esc.comparison = compare(&reply.params, expected);
-                report_comparison(out, &esc.comparison);
-            }
-            esc.block = Some(reply.params);
-        }
-        Err(error) => {
-            say!(out, "  read failed: {error}");
-            esc.error = Some(format!("read: {error}"));
         }
     }
-    esc
+    say!(
+        out,
+        "  dump: {} bytes in {:.1} s",
+        bytes.len(),
+        started.elapsed().as_secs_f64()
+    );
+    Ok(bytes)
 }
 
 /// The configurator's retry rule (`four_way.ts:373-428`): `timing.tries` tries, `timing.retry_delay`
@@ -620,7 +740,7 @@ fn with_retries<L: Link + ?Sized>(
     Err("max retries reached".into())
 }
 
-fn send_exit<L: Link + ?Sized>(
+pub fn send_exit<L: Link + ?Sized>(
     link: &mut L,
     options: &Options,
     out: &mut dyn Write,
@@ -720,7 +840,7 @@ fn report_comparison(out: &mut dyn Write, comparison: &Comparison) {
     }
 }
 
-fn hex_dump(out: &mut dyn Write, bytes: &[u8]) {
+pub(crate) fn hex_dump(out: &mut dyn Write, bytes: &[u8]) {
     for (row, chunk) in bytes.chunks(16).enumerate() {
         let hex: Vec<String> = chunk.iter().map(|b| format!("{b:02x}")).collect();
         say!(out, "    {:04x}  {}", row * 16, hex.join(" "));
@@ -741,6 +861,34 @@ pub fn save_blocks(
         if let Some(block) = &esc.block {
             let path = dir.join(format!("esc{}.bin", esc.index + 1));
             std::fs::write(&path, block)?;
+            written.push(path);
+        }
+    }
+    Ok(written)
+}
+
+/// Writes each dump of `report` to `dir/escN-flash-<start>-<length>.bin` (N from 1; start and length
+/// in hexadecimal with four digits). Returns the paths written.
+///
+/// # Errors
+///
+/// The first I/O error.
+pub fn save_dumps(
+    dir: &std::path::Path,
+    report: &Report,
+    dump: Dump,
+) -> std::io::Result<Vec<std::path::PathBuf>> {
+    let mut written = Vec::new();
+    for esc in &report.escs {
+        if let Some(bytes) = &esc.dump {
+            let name = format!(
+                "esc{}-flash-0x{:04x}-0x{:04x}.bin",
+                esc.index + 1,
+                dump.start,
+                dump.length
+            );
+            let path = dir.join(name);
+            std::fs::write(&path, bytes)?;
             written.push(path);
         }
     }

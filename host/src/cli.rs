@@ -1,5 +1,6 @@
 //! The command line.
 
+use crate::tool::Dump;
 use std::path::PathBuf;
 
 /// The USB ids of the bench boards.
@@ -33,6 +34,8 @@ pub struct Args {
     pub out: Option<PathBuf>,
     /// `--no-exit`.
     pub no_exit: bool,
+    /// `--dump`.
+    pub dump: Option<Dump>,
 }
 
 /// What the command line asks for.
@@ -48,6 +51,7 @@ pub enum Command {
 pub const USAGE: &str = "\
 esc-passthrough-host [--port PATH | --vid-pid VVVV:PPPP] [--escs N] [--address 0x7C00]
                      [--length 184] [--compare FILE...] [--out DIR] [--no-exit]
+                     [--dump START:LENGTH]
 
 Reads the settings block of each motor controller behind a flight controller's AM32
 passthrough, as the configurator does, and never writes. See README.md.
@@ -60,11 +64,14 @@ passthrough, as the configurator does, and never writes. See README.md.
   --compare FILE...  one file per controller, in order; report equal or the differing offsets
   --out DIR          save each block as DIR/esc1.bin, esc2.bin, ...
   --no-exit          do not send interface-exit at the end
+  --dump S:L         after the settings block read L bytes of flash from wire address S in
+                     chunks of at most 256 bytes and save escN-flash-<S>-<L>.bin under --out
+                     (required); S and L decimal or 0x hexadecimal; S + L at most 0x10000
 
 Exit status: 0 all answered and all comparisons equal; 1 the board or a controller did not
 answer; 2 a comparison found a difference; 3 passthrough refused; 64 bad command line.";
 
-fn number(text: &str) -> Result<u32, String> {
+pub(crate) fn number(text: &str) -> Result<u32, String> {
     let parsed = match text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
         Some(hex) => u32::from_str_radix(hex, 16),
         None => text.parse(),
@@ -72,7 +79,7 @@ fn number(text: &str) -> Result<u32, String> {
     parsed.map_err(|_| format!("'{text}' is not a number"))
 }
 
-fn hex16(text: &str) -> Result<u16, String> {
+pub(crate) fn hex16(text: &str) -> Result<u16, String> {
     u16::from_str_radix(text, 16).map_err(|_| format!("'{text}' is not a 4-digit hexadecimal id"))
 }
 
@@ -92,6 +99,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Command, String>
         compare: Vec::new(),
         out: None,
         no_exit: false,
+        dump: None,
     };
     while let Some(arg) = args.next() {
         let mut value = |name: &str| args.next().ok_or_else(|| format!("{name} needs a value"));
@@ -143,8 +151,24 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Command, String>
             }
             "--out" => parsed.out = Some(PathBuf::from(value("--out")?)),
             "--no-exit" => parsed.no_exit = true,
+            "--dump" => {
+                let text = value("--dump")?;
+                let (start, length) = text
+                    .split_once(':')
+                    .ok_or_else(|| format!("'{text}' is not START:LENGTH"))?;
+                let start = u16::try_from(number(start)?)
+                    .map_err(|_| "--dump START must fit 16 bits".to_string())?;
+                let length = number(length)?;
+                if length == 0 || u32::from(start) + length > 0x1_0000 {
+                    return Err("--dump needs LENGTH >= 1 and START + LENGTH <= 0x10000".into());
+                }
+                parsed.dump = Some(Dump { start, length });
+            }
             other => return Err(format!("unknown argument '{other}'")),
         }
+    }
+    if parsed.dump.is_some() && parsed.out.is_none() {
+        return Err("--dump needs --out DIR".into());
     }
     if let Some(port) = port {
         parsed.port = port;

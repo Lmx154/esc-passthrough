@@ -6,6 +6,20 @@ edition = "2024"
 publish = false
 license = "MIT"
 
+[features]
+# Compiles src/write/ and the esc-passthrough-restore binary: the only code in the package that can
+# form a device-write. A default build contains none of it.
+write = []
+
+[[bin]]
+name = "esc-passthrough-host"
+path = "src/main.rs"
+
+[[bin]]
+name = "esc-passthrough-restore"
+path = "src/write/main.rs"
+required-features = ["write"]
+
 [dependencies]
 serialport = "4.10.1"
 

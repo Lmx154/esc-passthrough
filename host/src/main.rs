@@ -52,6 +52,7 @@ fn main() -> ExitCode {
         length: args.length,
         compare,
         no_exit: args.no_exit,
+        dump: args.dump,
         timing: Timing::configurator(),
     };
     let report = tool::run(&mut link, &options, &mut std::io::stdout());
@@ -68,6 +69,21 @@ fn main() -> ExitCode {
                 eprintln!("error: saving into {}: {error}", dir.display());
                 if status == 0 {
                     status = 1;
+                }
+            }
+        }
+        if let Some(dump) = args.dump {
+            match tool::save_dumps(dir, &report, dump) {
+                Ok(paths) => {
+                    for path in paths {
+                        println!("saved {}", path.display());
+                    }
+                }
+                Err(error) => {
+                    eprintln!("error: saving into {}: {error}", dir.display());
+                    if status == 0 {
+                        status = 1;
+                    }
                 }
             }
         }

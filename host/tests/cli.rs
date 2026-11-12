@@ -81,3 +81,34 @@ fn parse_rejects_bad_input() {
     }
     assert_eq!(parse(&["--help"]), Ok(Command::Help));
 }
+
+#[test]
+fn parse_dump_takes_hex_or_decimal_and_needs_out() {
+    use esc_passthrough_host::tool::Dump;
+    let args = run(&["--dump", "0x0:0x8000", "--out", "d"]);
+    assert_eq!(
+        args.dump,
+        Some(Dump {
+            start: 0,
+            length: 0x8000
+        })
+    );
+    assert_eq!(
+        run(&["--dump", "4096:700", "--out", "d"]).dump,
+        Some(Dump {
+            start: 4096,
+            length: 700
+        })
+    );
+    assert_eq!(run(&[]).dump, None);
+    for bad in [
+        &["--dump", "0x1000:0x100"][..],
+        &["--dump", "0x1000", "--out", "d"],
+        &["--dump", "0x1000:0", "--out", "d"],
+        &["--dump", "0x10000:1", "--out", "d"],
+        &["--dump", "0xFF00:0x200", "--out", "d"],
+        &["--dump", "x:1", "--out", "d"],
+    ] {
+        assert!(parse(bad).is_err(), "{bad:?}");
+    }
+}
