@@ -442,7 +442,7 @@ fn write_then_read_returns_what_was_written_at_the_settings_and_an_application_a
     // writes its own version into byte 2 of a block longer than two bytes (BL:650-658, version
     // 19 in Inc/version.h): the data that comes back is what the ESC holds, not the exact bytes
     // sent. The client does not look at it.
-    for len in [1usize, 2, 184, 255, 256] {
+    for len in [2usize, 3, 4, 184, 255, 256] {
         for address in [0x0020u16, SETTINGS, APP] {
             let mut client = client();
             let data = pattern(len, len as u8);
@@ -482,11 +482,11 @@ fn write_below_the_application_is_refused_and_changes_nothing() {
 #[test]
 fn write_to_a_part_that_wants_aligned_writes_is_refused_at_program() {
     // Mcu/f421/Src/eeprom.c:11: address and length multiples of 4 (the settings block's 184
-    // bytes pass, one byte does not).
+    // bytes pass, two bytes do not).
     let sim = Sim::new(vec![EscModel::f421(0x14).with_write_granule(4)]).burst();
     let mut client = client_on(sim, 0);
     assert_eq!(
-        block_on(client.write(APP, &[1])),
+        block_on(client.write(APP, &[1, 2])),
         Err(Error::Refused {
             step: Step::Program,
             ack: Ack::BadCommand
@@ -502,9 +502,10 @@ fn works_again_aligned(client: &mut Client<Sim>) {
 }
 
 #[test]
-fn write_refuses_data_of_0_or_more_than_256_bytes_before_sending() {
+fn write_refuses_data_of_0_1_or_more_than_256_bytes_before_sending() {
     let mut client = client();
     assert_eq!(block_on(client.write(APP, &[])), Err(Error::InvalidLength));
+    assert_eq!(block_on(client.write(APP, &[7])), Err(Error::InvalidLength));
     assert_eq!(
         block_on(client.write(APP, &[0; 257])),
         Err(Error::InvalidLength)
@@ -591,26 +592,38 @@ fn run_application_when_the_esc_refuses_to_jump_leaves_it_in_the_bootloader() {
 }
 
 #[test]
-fn run_application_accepts_silence_and_refuses_other_answers() {
+fn run_application_accepts_silence_and_drops_whatever_arrives() {
     let mut client = client();
     client.line_mut().fault(0, Fault::NoAnswer);
     block_on(client.run_application()).unwrap();
-    let mut client = self::client();
-    client.line_mut().fault(0, Fault::Replace(vec![0x55]));
+    // An answer that is not a C1, a started application's chatter, in pieces: all dropped.
+    for chatter in [
+        vec![0x55],
+        vec![0xC1, 0xC1],
+        (0..400).map(|i| i as u8).collect(),
+    ] {
+        let mut client = Client::new(Sim::single().burst().with_max_per_read(32));
+        client.select(0).unwrap();
+        client.line_mut().fault(0, Fault::Replace(chatter));
+        block_on(client.run_application()).unwrap();
+        assert!(esc(&client).running());
+        // Nothing is left on the line for the next operation to trip over.
+        let mut left = [0u8; 8];
+        assert_eq!(block_on(client.line_mut().read(&mut left, 0)), Ok(0));
+    }
+}
+
+#[test]
+fn run_application_reports_a_line_error_while_it_waits() {
+    let mut client = client();
+    client
+        .line_mut()
+        .inject_line_error(LineErrorAt::ReadAfter(1));
     assert_eq!(
         block_on(client.run_application()),
-        Err(Error::Unexpected {
+        Err(Error::Line {
             step: Step::Run,
-            byte: 0x55
-        })
-    );
-    let mut client = self::client();
-    client.line_mut().fault(0, Fault::Replace(vec![0xC1, 0xC1]));
-    assert_eq!(
-        block_on(client.run_application()),
-        Err(Error::Unexpected {
-            step: Step::Run,
-            byte: 0xC1
+            error: SimError::Injected
         })
     );
 }
@@ -713,7 +726,7 @@ fn line_error_names_the_step_the_line_failed_in() {
 
     client.line_mut().inject_line_error(LineErrorAt::NextWrite);
     assert_eq!(
-        block_on(client.write(APP, &[1])),
+        block_on(client.write(APP, &[1, 2])),
         Err(Error::Line {
             step: Step::SetAddress,
             error: SimError::Injected
@@ -726,7 +739,7 @@ fn line_error_names_the_step_the_line_failed_in() {
         .line_mut()
         .inject_line_error(LineErrorAt::ReadAfter(2));
     assert_eq!(
-        block_on(client.write(APP, &[1])),
+        block_on(client.write(APP, &[1, 2])),
         Err(Error::Line {
             step: Step::SetBuffer,
             error: SimError::Injected
@@ -1085,13 +1098,13 @@ fn every_operation_resyncs_a_marked_line_first() {
     for op in 0..6 {
         let mut client = client();
         client.line_mut().corrupt_burst(0, 1, 5, 0x01); // damaged set buffer: C2, ESC not stuck
-        assert!(block_on(client.write(APP, &[1])).is_err());
+        assert!(block_on(client.write(APP, &[1, 2])).is_err());
         assert!(client.needs_resync());
         let mark = esc(&client).bursts().len();
         match op {
             0 => drop(block_on(client.connect()).unwrap()),
             1 => block_on(client.read(APP, &mut [0; 2])).unwrap(),
-            2 => block_on(client.write(APP, &[7])).unwrap(),
+            2 => block_on(client.write(APP, &[7, 8])).unwrap(),
             3 => block_on(client.erase(APP)).unwrap(),
             4 => block_on(client.keep_alive()).unwrap(),
             _ => block_on(client.run_application()).unwrap(),
@@ -1230,23 +1243,70 @@ fn a_write_that_fails_after_the_payload_was_acknowledged_does_not_mark_the_line(
 }
 
 #[test]
-fn a_one_byte_payload_the_esc_still_waits_for_cannot_be_cleared_by_the_keep_alive() {
-    // The ESC waiting for 1 + 2 bytes keeps only the first three of the keep-alive and answers
-    // C2 (BL:1020-1027, 586): the limit named in the module note. The error is reported, the
-    // mark stays.
+fn a_one_byte_write_sends_nothing_and_does_not_mark_the_line() {
+    // No supported part programs a single byte, and an ESC waiting for a one-byte payload is the
+    // one state the keep-alive cannot clear (it keeps three bytes of the four and answers C2),
+    // so the client never sets that buffer size.
     let mut client = client();
-    client.line_mut().corrupt_burst(0, 2, 0, 0xFF);
-    assert!(block_on(client.write(APP, &[7])).is_err());
-    assert!(esc(&client).expecting_payload());
-    assert_eq!(
-        block_on(client.resync()),
-        Err(Error::Refused {
-            step: Step::Resync,
-            ack: Ack::BadCrc
-        })
-    );
-    assert!(client.needs_resync());
-    assert!(esc(&client).expecting_payload());
+    assert_eq!(block_on(client.write(APP, &[7])), Err(Error::InvalidLength));
+    assert!(client.line().log().is_empty());
+    assert!(writes(&client).is_empty());
+    assert!(!client.needs_resync());
+    assert!(!esc(&client).expecting_payload());
+    works_again(&mut client);
+}
+
+/// The keep-alive probe clears an ESC left waiting for a payload of every length the client
+/// can send (2 to 256). Why it does, from `main.c` (BL:1020-1027 stores at most size + 2 bytes
+/// of a burst, BL:583-600 checks the CRC over `size` bytes against the two that follow, the
+/// receive buffer is zero-filled at BL:1010):
+/// - size 2: size + 2 = 4, exactly the keep-alive `FD 00 40 90`: the CRC of `FD 00` (0x9040) is
+///   the two bytes that follow.
+/// - size 3: size + 2 = 5, all four bytes are kept and the fifth is 0. The check compares
+///   the CRC of `FD 00 40` with the bytes that follow, `90 00`: it is 0x0090 (the CRC of
+///   `FD 00` is 0x9040, and one more byte `40` leaves 0x0090), worked out with a separate
+///   script, so it passes.
+/// - size 4 and more: a frame followed by its own CRC has CRC 0, and the bytes after the
+///   frame are zero, so the CRC over `size` bytes is 0 and so are the two bytes read.
+#[test]
+fn the_probe_clears_an_esc_waiting_for_a_payload_of_every_allowed_length() {
+    for len in [2usize, 3, 4, 5, 184, 255, 256] {
+        let mut client = client();
+        let data = pattern(len, 3);
+        // The payload burst (the third) is damaged: C2 and the ESC keeps waiting for len + 2.
+        client.line_mut().corrupt_burst(0, 2, 0, 0xFF);
+        assert_eq!(
+            block_on(client.write(0x3000, &data)),
+            Err(Error::Refused {
+                step: Step::Payload,
+                ack: Ack::BadCrc
+            }),
+            "len {len}"
+        );
+        assert!(
+            esc(&client).expecting_payload() && client.needs_resync(),
+            "len {len}"
+        );
+
+        let before = esc(&client).flash().to_vec();
+        let mark = esc(&client).bursts().len();
+        let answers = esc(&client).answers().len();
+        let other = pattern(len, 99);
+        block_on(client.write(0x4000, &other)).unwrap();
+
+        // One keep-alive first, taken as the awaited payload and answered 30.
+        assert_eq!(
+            bursts_from(&client, 0, mark)[0],
+            KEEP_ALIVE_FRAME,
+            "len {len}"
+        );
+        assert_eq!(esc(&client).answers()[answers], [0x30], "len {len}");
+        assert!(!client.needs_resync() && !esc(&client).expecting_payload());
+        // The write landed at 0x4000 and nowhere else.
+        let mut expected = before;
+        expected[0x4000..0x4000 + len].copy_from_slice(&other);
+        assert_eq!(esc(&client).flash(), &expected[..], "len {len}");
+    }
 }
 
 #[test]
@@ -1402,12 +1462,12 @@ impl EscLines for Script {
 fn set_buffer_answered_with_30_is_tolerated_and_anything_else_is_not() {
     // AP:899-905 goes on after brNONE or brSUCCESS and fails on any other byte.
     let mut ok = Client::new(Script::new(&[&[0x30], &[0x30], &[0x30], &[0x30]]));
-    assert_eq!(block_on(ok.write(APP, &[1])), Ok(()));
+    assert_eq!(block_on(ok.write(APP, &[1, 2])), Ok(()));
     assert_eq!(ok.line().written.len(), 4);
 
     let mut refused = Client::new(Script::new(&[&[0x30], &[0xC1]]));
     assert_eq!(
-        block_on(refused.write(APP, &[1])),
+        block_on(refused.write(APP, &[1, 2])),
         Err(Error::Refused {
             step: Step::SetBuffer,
             ack: Ack::BadCommand
@@ -1415,7 +1475,7 @@ fn set_buffer_answered_with_30_is_tolerated_and_anything_else_is_not() {
     );
     let mut odd = Client::new(Script::new(&[&[0x30], &[0x77]]));
     assert_eq!(
-        block_on(odd.write(APP, &[1])),
+        block_on(odd.write(APP, &[1, 2])),
         Err(Error::Unexpected {
             step: Step::SetBuffer,
             byte: 0x77
@@ -1493,7 +1553,7 @@ fn app_range() -> impl Strategy<Value = u16> {
 }
 
 fn data_pair() -> impl Strategy<Value = (Vec<u8>, Vec<u8>)> {
-    (1usize..=256).prop_flat_map(|len| {
+    (2usize..=256).prop_flat_map(|len| {
         (
             prop::collection::vec(any::<u8>(), len),
             prop::collection::vec(any::<u8>(), len),
