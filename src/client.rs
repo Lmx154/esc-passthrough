@@ -16,7 +16,7 @@
 //! | [`Client::write`] | set address (`30`), set buffer (nothing; waits [`Timeouts::set_buffer_us`]), payload (`30`), program (`30`) |
 //! | [`Client::erase`] | set address (`30`), erase (`30`) |
 //! | [`Client::keep_alive`] | keep-alive (`C1`, which is success) |
-//! | [`Client::run_application`] | run (at most a `C1`) |
+//! | [`Client::run_application`] | run (a `C1`, then whatever the application sends, dropped) |
 //!
 //! Every operation first reads the line with a timeout of 0 until it returns nothing, to throw
 //! away bytes an earlier, failed exchange left behind. Bytes that are still in flight are not
@@ -36,10 +36,12 @@
 //!   one keep-alive and accepts `30` (the ESC was waiting for a payload and took it) or `C1`
 //!   (it was not). Anything else is an error, the mark stays and the operation is not started.
 //!   A keep-alive is harmless in both states.
-//! - Limit: if the ESC is waiting for a payload of one byte it takes only the first three bytes
-//!   of the keep-alive and answers `C2`. That is an error ([`Step::Resync`], `Refused`) and the
-//!   mark stays; the client cannot clear it without sending bytes that would be a command if
-//!   the ESC were not waiting.
+//! - A write is 2 to 256 bytes. A single byte is refused before anything is sent, because no
+//!   supported part programs one byte (the smallest write unit is 2) and an ESC waiting for a
+//!   one-byte payload is the one state the keep-alive cannot clear (it would keep only the
+//!   first three bytes of the probe and answer `C2`). For every length from 2 the probe works.
+//! - Inherent to the protocol, and not removable here: if the set-buffer frame is lost on the
+//!   wire, the bootloader reads the payload that follows as commands.
 //!
 //! Other state: a read forgets the address, and each operation here sets the address itself.
 //! A program is refused (`C1`) below the ESC's application, and on most parts also for an
@@ -59,6 +61,8 @@ use crate::line::EscLines;
 const FRAME_LEN: usize = MAX_DATA + 2;
 /// The longest reply: 256 data bytes, CRC and acknowledge.
 const REPLY_LEN: usize = MAX_DATA + READ_REPLY_OVERHEAD;
+/// The smallest write: no supported part programs a single byte.
+const MIN_WRITE: usize = 2;
 const DRAIN_CHUNK: usize = 32;
 const DRAIN_MAX_READS: usize = 16;
 
@@ -202,7 +206,8 @@ pub enum Step {
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[non_exhaustive]
 pub enum Error<E> {
-    /// A length argument is outside 1 to 256. Nothing was sent.
+    /// A length argument is outside its range (1 to 256 for a read, 2 to 256 for a write).
+    /// Nothing was sent.
     InvalidLength,
     /// A line number above 31; [`Client::select`] keeps state for lines 0 to 31 only.
     InvalidLine,
@@ -406,19 +411,20 @@ impl<L: EscLines> Client<L> {
         Ok(())
     }
 
-    /// Writes `data` (1 to 256 bytes) at `address`: set address, set buffer, payload, program.
+    /// Writes `data` (2 to 256 bytes) at `address`: set address, set buffer, payload, program.
     /// Set buffer has no acknowledge; the client waits [`Timeouts::set_buffer_us`] and goes on.
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidLength`] unless `data` holds 1 to 256 bytes (nothing is sent); otherwise
+    /// [`Error::InvalidLength`] unless `data` holds 2 to 256 bytes (nothing is sent, the line is
+    /// not marked); otherwise
     /// [`Error`] with [`Step::SetAddress`], [`Step::SetBuffer`] (the ESC answered `C1`/`C2`, or
     /// an unknown byte; a `30` is tolerated as ArduPilot does), [`Step::Payload`] or
     /// [`Step::Program`]; or the error of the resync that a marked line gets first. A failure
     /// after set buffer was sent and before the payload's `30` marks the line (see the module's
     /// note on the resync).
     pub async fn write(&mut self, address: u16, data: &[u8]) -> Result<(), Error<L::Error>> {
-        if data.is_empty() || data.len() > MAX_DATA {
+        if data.len() < MIN_WRITE || data.len() > MAX_DATA {
             return Err(Error::InvalidLength);
         }
         self.prepare().await?;
@@ -509,35 +515,36 @@ impl<L: EscLines> Client<L> {
     }
 
     /// Sends run (`00 00 00 00`): the bootloader starts its application unless its own checks
-    /// refuse. It sends a `C1` first, which this reads and drops (and nothing at all is fine).
-    /// `Ok` does not say whether the ESC jumped.
+    /// refuse. It sends a `C1` first; this reads and drops whatever arrives (bounded: 16 reads of 32 bytes)
+    /// until [`Timeouts::run_us`] passes with nothing, because a started application may put
+    /// bytes on the line. `Ok` does not say whether the ESC jumped.
     ///
     /// # Errors
     ///
-    /// [`Error`] with [`Step::Run`]: [`Error::Line`], or [`Error::Unexpected`] for an answer
-    /// that is not a single `C1`.
+    /// [`Error::Line`] with [`Step::Run`] (or an error of the resync of a marked line); what
+    /// arrives after run is never an error.
     pub async fn run_application(&mut self) -> Result<(), Error<L::Error>> {
         self.prepare().await?;
         let mut frame = [0u8; FRAME_LEN];
         let len = bl::encode_run(&mut frame);
         self.send_frame(Step::Run, &frame, len).await?;
-        let mut answer = [0u8; 2];
-        let got = self
-            .line
-            .read(&mut answer, self.timeouts.run_us)
-            .await
-            .map_err(|error| Error::Line {
-                step: Step::Run,
-                error,
-            })?;
-        match (got, answer.first().copied().unwrap_or(0)) {
-            (0, _) => Ok(()),
-            (1, byte) if byte == Ack::BadCommand.code() => Ok(()),
-            (_, byte) => Err(Error::Unexpected {
-                step: Step::Run,
-                byte,
-            }),
+        // The bootloader sends a C1 first and an application that has started may put bytes on
+        // the line: read and drop whatever comes until `run_us` passes with nothing.
+        let mut scratch = [0u8; DRAIN_CHUNK];
+        for _ in 0..DRAIN_MAX_READS {
+            let got = self
+                .line
+                .read(&mut scratch, self.timeouts.run_us)
+                .await
+                .map_err(|error| Error::Line {
+                    step: Step::Run,
+                    error,
+                })?;
+            if got == 0 {
+                break;
+            }
         }
+        Ok(())
     }
 
     const fn slot_bit(&self) -> u64 {
