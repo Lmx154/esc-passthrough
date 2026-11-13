@@ -5,6 +5,11 @@ edition = "2024"
 publish = false
 license = "MIT"
 description = "Sans-IO codecs for letting the AM32 configurator reach ESCs through a flight controller: MSP v1, the four-way interface and the AM32 bootloader byte sequences. No I/O."
+repository = "https://github.com/Lmx154/esc-passthrough"
+readme = "README.md"
+keywords = ["embedded", "no-std", "esc", "msp", "am32"]
+categories = ["embedded", "no-std", "no-std::no-alloc", "hardware-support"]
+rust-version = "1.99"
 
 [features]
 defmt = ["dep:defmt"]

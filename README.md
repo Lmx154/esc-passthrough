@@ -4,6 +4,10 @@ Sans-IO codecs for letting the AM32 configurator on a computer reach ESCs throug
 
 Status: version 0.1.0, `publish = false`, and the API may still change. It has been tested on a host, and on one bench (2026-11-12): through the demonstration in `hil/` on a MARV V2 board the real AM32 configurator read four ESCs, changed a setting on one and flashed one (AM32 2.20 on AT32F421, bootloader version 1; see "Measured on a board"). Every byte sequence was written from the configurator's source, the AM32 bootloader's source and ArduPilot's behaviour, and the golden vectors were worked out by hand from them; that bench is the only real traffic they have met. Not tried: any other ESC, MCU or bootloader version, and a serial port shared with another protocol.
 
+## Works with
+
+The crate works with any HAL and any MCU that provides `embedded-io-async` 0.7 streams and an `embedded-hal-async` 1.0 `DelayNs`. No embassy crate is needed.
+
 ## Quick start
 
 MSP: parse the configurator's requests a byte at a time (or in slices, split anywhere) and write the reply into your own buffer.
